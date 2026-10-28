@@ -1,0 +1,86 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>AR Chess Assistant</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.2/chess.min.js"></script>
+<style>
+:root{--bg:#f2f6f5;--fg:#0b1110;--bar:#ffffffee;--bd:#c5d3cf;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0b1110;--fg:#e8f3ef;--bar:#0b1110ee;--bd:#2a3a36;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0b1110;--fg:#e8f3ef;--bar:#0b1110ee;--bd:#2a3a36;color-scheme:dark}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+body{display:flex;flex-direction:column}
+#st{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#000}
+canvas{max-width:100%;max-height:100%;touch-action:none}
+#bar{padding:10px;background:var(--bar);border-top:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#msg{flex-basis:100%;font-weight:600}
+button,select,input{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--bg);color:var(--fg)}
+input{flex:1;min-width:120px}
+</style></head><body>
+<div id="st"><canvas id="c" width="640" height="480"></canvas><video id="v" playsinline muted style="display:none"></video></div>
+<div id="bar"><div id="msg">Starting camera…</div>
+<select id="sd"><option value="w">I play White</option><option value="b">I play Black</option></select>
+<button id="cal">Calibrate</button><button id="ng">New game</button>
+<input id="fen" placeholder="FEN (optional, mid-game)"></div>
+<script>
+const $=i=>document.getElementById(i),V=$('v'),C=$('c'),X=C.getContext('2d',{willReadFrequently:true});
+let game=new Chess(),H=null,Hi=null,taps=[],snap=null,prev=null,calm=0,hint=null,sel=null,last=0;
+const NM={p:'PAWN',n:'KNIGHT',b:'BISHOP',r:'ROOK',q:'QUEEN',k:'KING'},PV={p:100,n:320,b:330,r:500,q:900,k:0};
+const say=t=>$('msg').textContent=t,side=()=>$('sd').value,sqn=(f,r)=>'abcdefgh'[f]+(r+1);
+function homog(S,D){const A=[];S.forEach(([x,y],i)=>{const[u,v]=D[i];A.push([x,y,1,0,0,0,-u*x,-u*y,u],[0,0,0,x,y,1,-v*x,-v*y,v])});
+for(let i=0;i<8;i++){let m=i;for(let r=i+1;r<8;r++)if(Math.abs(A[r][i])>Math.abs(A[m][i]))m=r;[A[i],A[m]]=[A[m],A[i]];
+for(let r=0;r<8;r++)if(r!=i){const f=A[r][i]/A[i][i];for(let c=i;c<9;c++)A[r][c]-=f*A[i][c]}}
+return[...A.map((r,i)=>r[8]/r[i]),1]}
+const ap=(M,x,y)=>{const w=M[6]*x+M[7]*y+M[8];return[(M[0]*x+M[1]*y+M[2])/w,(M[3]*x+M[4]*y+M[5])/w]};
+function inv(m){const[a,b,c,d,e,f,g,h,i]=m,A=e*i-f*h,B=f*g-d*i,K=d*h-e*g,D=a*A+b*B+c*K;
+return[A,c*h-b*i,b*f-c*e,B,a*i-c*g,c*d-a*f,K,b*g-a*h,a*e-b*d].map(v=>v/D)}
+// ---- engine: depth-3 negamax (swap for Stockfish in the native app)
+function ev(g){let s=0;g.board().forEach((row,i)=>row.forEach((p,j)=>{if(p){const c=(3.5-Math.abs(i-3.5))+(3.5-Math.abs(j-3.5));s+=(p.color=='w'?1:-1)*(PV[p.type]+(p.type=='k'||p.type=='p'?0:c*4))}}));return s}
+const cap=(x,y)=>(y.captured?PV[y.captured]:0)-(x.captured?PV[x.captured]:0);
+function nm(g,d,a,b){if(g.in_checkmate())return-1e5-d;if(g.game_over())return 0;if(!d)return ev(g)*(g.turn()=='w'?1:-1);
+for(const m of g.moves({verbose:true}).sort(cap)){g.move(m);const s=-nm(g,d-1,-b,-a);g.undo();if(s>=b)return b;if(s>a)a=s}return a}
+function pick(g){let best=null,a=-1e9;for(const m of g.moves({verbose:true}).sort(cap)){g.move(m);const s=-nm(g,2,-1e9,-a);g.undo();if(s>a){a=s;best=m}}return best}
+const label=m=>m.flags.includes('k')?'CASTLE KINGSIDE':m.flags.includes('q')?'CASTLE QUEENSIDE':NM[m.piece]+' '+m.from+' → '+m.to;
+function analyze(){hint=null;if(game.game_over()){say(game.in_checkmate()?'Checkmate':'Game over');return}
+if(game.turn()==side()){say('Thinking…');setTimeout(()=>{hint=pick(game);say('Your move: '+label(hint))},40)}else say("Opponent's turn — waiting for their move")}
+// ---- board vision: per-square luminance signature, diff vs last stable state
+function sample(){const W=C.width,id=X.getImageData(0,0,W,C.height).data,o=new Float32Array(1600);let k=0;
+for(let r=0;r<8;r++)for(let f=0;f<8;f++)for(let i=0;i<5;i++)for(let j=0;j<5;j++){const[x,y]=ap(H,f+.2+.15*i,r+.2+.15*j),p=(Math.round(y)*W+Math.round(x))*4;
+o[k++]=p>=0&&p<id.length?.3*id[p]+.59*id[p+1]+.11*id[p+2]:0}return o}
+const sq=(a,b)=>{const d=[];for(let s=0;s<64;s++){let t=0;for(let k=0;k<25;k++)t+=Math.abs(a[s*25+k]-b[s*25+k]);d.push(t/25)}return d};
+function detect(ch){let best=null,bs=-9;for(const m of game.moves({verbose:true})){if(m.promotion&&m.promotion!='q')continue;
+const e=new Set([m.from,m.to]),rk=m.color=='w'?'1':'8';
+if(m.flags.includes('k')){e.add('h'+rk);e.add('f'+rk)}if(m.flags.includes('q')){e.add('a'+rk);e.add('d'+rk)}if(m.flags.includes('e'))e.add(m.to[0]+m.from[1]);
+let s=0;e.forEach(q=>s+=ch.has(q)?1:-1);ch.forEach(q=>{if(!e.has(q))s--});if(s>bs){bs=s;best=m}}
+return bs>=2?best:null}
+function play(m){game.move({from:m.from,to:m.to,promotion:'q'});snap=null;analyze()}
+function check(s){const d=sq(s,snap),med=[...d].sort((a,b)=>a-b)[32],th=Math.max(14,med*4),ch=new Set();
+d.forEach((v,i)=>{if(v>th)ch.add(sqn(i%8,Math.floor(i/8)))});
+if(ch.size<2){snap=s;return}const m=detect(ch);if(m){say('Detected '+m.san);play(m)}else say("Couldn't match that move — tap the from and to squares to fix")}
+// ---- AR overlay
+const Q=(f,r)=>[[f,r],[f+1,r],[f+1,r+1],[f,r+1]].map(([x,y])=>ap(H,x,y)),ctr=n=>ap(H,n.charCodeAt(0)-97+.5,+n[1]-1+.5);
+function poly(p,fill,st,w){X.beginPath();p.forEach((q,i)=>i?X.lineTo(...q):X.moveTo(...q));X.closePath();if(fill){X.fillStyle=fill;X.fill()}if(st){X.strokeStyle=st;X.lineWidth=w;X.stroke()}}
+function arrow(a,b){const t=Math.atan2(b[1]-a[1],b[0]-a[0]),L=C.width/60;X.strokeStyle=X.fillStyle='#39ff4a';X.lineWidth=L/2;X.beginPath();X.moveTo(...a);X.lineTo(...b);X.stroke();
+X.beginPath();X.moveTo(...b);[2.6,-2.6].forEach(d=>X.lineTo(b[0]+L*2*Math.cos(t+d),b[1]+L*2*Math.sin(t+d)));X.fill()}
+function hl(n){const f=n.charCodeAt(0)-97,r=+n[1]-1;poly(Q(f,r),'rgba(57,255,74,.35)','#39ff4a',C.width/200)}
+function overlay(){const w=C.width;if(!H){taps.forEach((p,i)=>{X.fillStyle='#18e6ff';X.beginPath();X.arc(p[0],p[1],w/90,0,7);X.fill()});return}
+X.save();X.shadowColor='#18e6ff';X.shadowBlur=w/50;poly([[0,0],[8,0],[8,8],[0,8]].map(([x,y])=>ap(H,x,y)),null,'#18e6ff',w/150);X.restore();
+if(sel)poly(Q(sel.charCodeAt(0)-97,+sel[1]-1),'rgba(255,220,0,.35)','#ffdc00',w/200);
+if(!hint)return;const m=hint,rk=m.color=='w'?'1':'8';hl(m.from);hl(m.to);
+if(m.flags.includes('k')){hl('h'+rk);hl('f'+rk);arrow(ctr(m.from),ctr(m.to));arrow(ctr('h'+rk),ctr('f'+rk))}
+if(m.flags.includes('q')){hl('a'+rk);hl('d'+rk);arrow(ctr(m.from),ctr(m.to));arrow(ctr('a'+rk),ctr('d'+rk))}
+const p=ctr(m.to),fs=w/38;X.font='700 '+fs+'px system-ui,sans-serif';const t=label(m),bw=X.measureText(t).width+fs,bh=fs*2.3,x=p[0]-bw/2,y=p[1]-w/9;
+X.fillStyle='rgba(0,0,0,.8)';X.fillRect(x,y,bw,bh);X.strokeStyle='#39ff4a';X.lineWidth=2;X.strokeRect(x,y,bw,bh);
+X.fillStyle='#39ff4a';X.font='600 '+fs*.55+'px system-ui,sans-serif';X.fillText('NEXT MOVE',x+fs/2,y+fs*.8);X.fillStyle='#fff';X.font='700 '+fs+'px system-ui,sans-serif';X.fillText(t,x+fs/2,y+fs*1.8)}
+function frame(t){if(V.videoWidth){if(C.width!=V.videoWidth){C.width=V.videoWidth;C.height=V.videoHeight}X.drawImage(V,0,0);
+if(H&&t-last>250){last=t;const s=sample();if(!snap||!prev){snap=s}else{const m=sq(s,prev).reduce((a,b)=>a+b)/64;calm=m<3?calm+1:0;if(calm==3)check(s)}prev=s}overlay()}
+requestAnimationFrame(frame)}
+// ---- input
+const NAMES=['near-left (a1 side for White)','near-right','far-right','far-left'];
+C.addEventListener('pointerdown',e=>{const r=C.getBoundingClientRect(),x=(e.clientX-r.left)*C.width/r.width,y=(e.clientY-r.top)*C.height/r.height;
+if(!H){taps.push([x,y]);if(taps.length<4){say('Tap board corner: '+NAMES[taps.length]);return}
+const W=side()=='w',B=[[0,0],[8,0],[8,8],[0,8]],S=W?B:B.map(([a,b])=>[8-a,8-b]);H=homog(S,taps);Hi=inv(H);snap=null;prev=null;analyze();return}
+const[bx,by]=ap(Hi,x,y),f=Math.floor(bx),rr=Math.floor(by);if(f<0||f>7||rr<0||rr>7)return;const n=sqn(f,rr);
+if(!sel){sel=n;return}const m=game.moves({verbose:true}).find(m=>m.from==sel&&m.to==n);sel=null;if(m)play(m)});
+$('cal').onclick=()=>{H=null;Hi=null;taps=[];hint=null;sel=null;say('Tap board corner: '+NAMES[0]+' — clockwise from your side')};
+$('ng').onclick=()=>{const g=new Chess();if($('fen').value&&!g.load($('fen').value)){say('Invalid FEN');return}game=g;snap=null;hint=null;if(H)analyze();else say('Calibrate the board first')};
+(async()=>{try{V.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}},audio:false});await V.play();say('Tap the 4 board corners: '+NAMES[0]+', then clockwise');requestAnimationFrame(frame)}
+catch(e){say('Camera blocked — open this page directly in your phone browser and allow camera access')}})();
+</script></body></html>
