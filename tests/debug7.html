@@ -56,15 +56,32 @@ for (const [i, p] of poses.entries()) {
   const d = detectQuad(prep, W, H);
   const tD = performance.now() - t0;
   log(`pose ${String(i).padStart(2)} tilt=${p.tilt.toFixed(2)} size=${p.size.toFixed(0)} light=${p.light.toFixed(2)} noise=${p.noise} clut=${p.clutter} bd=${p.border}`);
-  log(`   GT score=${gt.score.toFixed(1)} sep=${gt.sep.toFixed(0)} sd=${(gt.sdA + gt.sdB).toFixed(1)} | cands=${cands.length} enum=${tE.toFixed(0)}ms detect=${tD.toFixed(0)}ms -> ${d ? `score=${d.score.toFixed(1)} err=${(err(d.quad, quad) / bw * 100).toFixed(1)}%` : 'NONE'}`);
-
-  if (cands.length < 6) {
-    const ls = houghLines(prep.mag, W, H, 14);
-    log(`   lines(${ls.length}): ` + ls.map((l) => `${l.theta.toFixed(0)}@${l.rho.toFixed(0)}`).join(' '));
-    log(`   GT quad: ${fmt(quad)}`);
+  log(`   GT score=${gt.score.toFixed(1)} sep=${gt.sep.toFixed(2)} sd=${(gt.sdA + gt.sdB).toFixed(2)} | cands=${cands.length} enum=${tE.toFixed(0)}ms detect=${tD.toFixed(0)}ms -> ${d ? `score=${d.score.toFixed(1)} err=${(err(d.quad, quad) / bw * 100).toFixed(1)}%` : 'NONE'}`);
+  {
+    const sd = [0, 1, 2, 3].map((i) => Math.hypot(quad[(i + 1) % 4][0] - quad[i][0], quad[(i + 1) % 4][1] - quad[i][1]));
+    const ar = ((sd[0] + sd[2]) / 2) / ((sd[1] + sd[3]) / 2);
+    log(`   GT sides=${sd.map((v) => v.toFixed(0)).join(',')} ar=${ar.toFixed(2)} oppA=${(Math.abs(sd[0] - sd[2]) / Math.max(sd[0], sd[2])).toFixed(2)} oppB=${(Math.abs(sd[1] - sd[3]) / Math.max(sd[1], sd[3])).toFixed(2)}`);
   }
 
-  // how would the top candidates rank if we scored every one of them?  const tried = [];
+  if (cands.length < 6 || String(i) === qp.get('dumppose')) {
+    const ls = houghLines(prep.mag2, prep.sw, prep.sh, +(qp.get('dump') || 24));
+    log(`   half lines(${ls.length}): ` + ls.map((l) => `${l.theta.toFixed(0)}@${l.rho.toFixed(0)}`).join(' '));
+    // the four GT sides as normal-form lines, in half-res coordinates
+    const sides = [];
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i], b = quad[(i + 1) % 4];
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const nx = -dy, ny = dx, L = Math.hypot(nx, ny);
+      let th = (Math.atan2(ny / L, nx / L) * 180) / Math.PI;
+      if (th < 0) th += 180;
+      const rho = ((a[0] / 2) * Math.cos((th * Math.PI) / 180) + (a[1] / 2) * Math.sin((th * Math.PI) / 180));
+      sides.push(`${th.toFixed(0)}@${rho.toFixed(0)}`);
+    }
+    log(`   GT sides: ${sides.join(' ')}`);
+  }
+
+  // how would the top candidates rank if we scored every one of them?
+  const tried = [];
   let shown = 0;
   for (const c of cands) {
     if (tried.length >= 40) break;
@@ -75,7 +92,7 @@ for (const [i, p] of poses.entries()) {
     const q = s2 || s1 || c.quad;
     const sc = validQuad(q, W, H) ? scoreQuad(prep, W, H, q) : null;
     const rel = err(q, quad) / bw;
-    if (sc) log(`     #${shown} area=${(c.area / (W * H) * 100).toFixed(1)}% rawErr=${(err(c.quad, quad) / bw * 100).toFixed(1)}% snapErr=${(rel * 100).toFixed(1)}% score=${sc.score.toFixed(1)} sep=${sc.sep.toFixed(0)}`);
+    if (sc) log(`     #${shown} area=${(c.area / (W * H) * 100).toFixed(1)}% rawErr=${(err(c.quad, quad) / bw * 100).toFixed(1)}% snapErr=${(rel * 100).toFixed(1)}% score=${sc.score.toFixed(1)} sep=${sc.sep.toFixed(2)}`);
     else log(`     #${shown} area=${(c.area / (W * H) * 100).toFixed(1)}% rawErr=${(err(c.quad, quad) / bw * 100).toFixed(1)}% invalid`);
     shown++;
     if (shown >= 8) break;

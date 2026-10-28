@@ -30,11 +30,13 @@ export function moveSquares(m) {
 /**
  * Pick the legal move that best explains the observed change set.
  *
- * A move must touch at least two changed squares (a single changed square is
- * almost always occlusion noise or a nudged piece) and must not leave more
- * than two changed squares unexplained.
+ * A move must touch at least two changed squares, must have *all* of its own
+ * squares changed (hits === touched.size), and must leave at most one changed
+ * square unexplained: with a 2-square allowance several unrelated moves fit
+ * the same three changed squares equally well, which is what made the reader
+ * report "ambiguous" instead of the obvious move.
  */
-export function inferMove(legalMoves, changed, { minScore = 1.2, minMargin = 0.55 } = {}) {
+export function inferMove(legalMoves, changed, { minScore = 1.6, minMargin = 0.5 } = {}) {
   const ranked = [];
   for (const m of legalMoves) {
     if (m.promotion && m.promotion !== 'q') continue;
@@ -44,11 +46,10 @@ export function inferMove(legalMoves, changed, { minScore = 1.2, minMargin = 0.5
     let extras = 0;
     for (const s of changed) if (!touched.has(s)) extras++;
 
-    const need = Math.min(2, touched.size);
-    if (hits < need) continue;
-    if (hits / touched.size < 0.6) continue;
-    if (extras > 2) continue;
-    ranked.push({ move: m, hits, extras, score: hits - 0.45 * extras });
+    if (hits < Math.min(2, touched.size)) continue;
+    if (hits !== touched.size) continue;
+    if (extras > 1) continue;
+    ranked.push({ move: m, hits, extras, score: hits - 1.2 * extras });
   }
   ranked.sort((a, b) => b.score - a.score || a.extras - b.extras);
 
@@ -75,7 +76,8 @@ export class MoveReader {
     this.base = null;   // descriptor of the last confirmed position
     this.prev = null;   // descriptor of the previous frame
     this.calm = 0;
-    this.noise = 6;
+    this.fired = false;
+    this.noise = 3;
     this.changed = new Set();
   }
 
@@ -84,13 +86,19 @@ export class MoveReader {
     this.base = desc;
     this.prev = desc;
     this.calm = 0;
+    this.fired = false;
     this.changed = new Set();
   }
 
-  push(desc) {
-    if (!this.base) {
+  push(desc, { gridMoved = false } = {}) {
+    if (!this.base || gridMoved) {
+      // A different sampling grid makes every square incomparable, so take the
+      // frame as the new reference instead of reporting a board-wide change.
       this.base = this.prev = desc;
-      return { changed: new Set(), settled: false, motion: 0, noise: this.noise };
+      this.calm = 0;
+      this.fired = false;
+      this.changed = new Set();
+      return { changed: new Set(), settled: false, motion: 0, noise: this.noise, threshold: 0, rebased: true };
     }
 
     const instant = squareDiff(desc, this.prev);
@@ -98,19 +106,20 @@ export class MoveReader {
     this.prev = desc;
 
     if (motion < this.noise * 1.8) this.calm++;
-    else this.calm = 0;
+    else { this.calm = 0; this.fired = false; }
 
     // Track the noise floor only while the board is still.
     if (motion < this.noise * 1.8) this.noise += (Math.max(2.5, motion) - this.noise) * 0.06;
 
-    const threshold = Math.max(10, this.noise * 3.2);
+    const threshold = Math.max(13, this.noise * 3);
     const vsBase = squareDiff(desc, this.base);
     const changed = new Set();
     for (let i = 0; i < 64; i++) if (vsBase[i] > threshold) changed.add(i);
     this.changed = changed;
 
-    // fire exactly once per settling, not on every calm frame after it
-    const settled = this.calm === 2 && changed.size > 0;
+    // fire once per settling: after two still frames with something changed
+    const settled = this.calm >= 2 && changed.size > 0 && !this.fired;
+    if (settled) this.fired = true;
     return { changed, settled, motion, noise: this.noise, threshold };
   }
 }

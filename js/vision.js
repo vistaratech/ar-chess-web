@@ -111,10 +111,38 @@ function sobelMagnitude(src, w, h) {
   return out;
 }
 
-/** Blur + edge magnitude, computed once per frame. */
+/**
+ * Blur + edge magnitude at full and half resolution.
+ *
+ * The half-resolution pyramid is what makes the board's *rim* findable: a
+ * half-pixel grid line mostly averages away, while the step between the board
+ * and the table survives. Hough on the full-res image instead tends to return
+ * the inner grid (and the rows of pieces), and then the outer edge never
+ * becomes a candidate.
+ */
 export function prepare(grayIn, w, h) {
   const gray = blur121(grayIn, w, h);
-  return { gray, mag: sobelMagnitude(gray, w, h) };
+  const mag = sobelMagnitude(gray, w, h);
+  const sw = Math.max(1, w >> 1), sh = Math.max(1, h >> 1);
+  const gray2 = new Float32Array(sw * sh);
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      const i = 2 * y * w + 2 * x;
+      gray2[y * sw + x] = 0.25 * (gray[i] + gray[i + 1] + gray[i + w] + gray[i + w + 1]);
+    }
+  }
+  const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
+  const gray4 = new Float32Array(sw4 * sh4);
+  for (let y = 0; y < sh4; y++) {
+    for (let x = 0; x < sw4; x++) {
+      const i = 2 * y * sw + 2 * x;
+      gray4[y * sw4 + x] = 0.25 * (gray2[i] + gray2[i + 1] + gray2[i + sw] + gray2[i + sw + 1]);
+    }
+  }
+  return {
+    gray, mag, sw, sh, gray2, mag2: sobelMagnitude(gray2, sw, sh),
+    sw4, sh4, gray4, mag4: sobelMagnitude(gray4, sw4, sh4),
+  };
 }
 
 function percentileFromHistogram(hist, total, q) {
@@ -213,12 +241,6 @@ export function houghLines(mag, w, h, maxLines = 20) {
   return kept;
 }
 
-function lineAngleDiff(a, b) {
-  let d = Math.abs(a.theta - b.theta) % 180;
-  if (d > 90) d = 180 - d;
-  return d;
-}
-
 function intersectLines(l1, l2) {
   const t1 = (l1.theta * Math.PI) / 180, t2 = (l2.theta * Math.PI) / 180;
   const c1 = Math.cos(t1), s1 = Math.sin(t1);
@@ -259,7 +281,17 @@ function isConvex(q) {
 function orderByAngle(pts) {
   const cx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4;
   const cy = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
-  return pts.slice().sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
+  const a = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i++) a[i] = Math.atan2(pts[i][1] - cy, pts[i][0] - cx);
+  // insertion sort of four indices by angle (no allocation, no closure)
+  const idx = [0, 1, 2, 3];
+  for (let i = 1; i < 4; i++) {
+    const v = idx[i];
+    let j = i - 1;
+    while (j >= 0 && a[idx[j]] > a[v]) { idx[j + 1] = idx[j]; j--; }
+    idx[j + 1] = v;
+  }
+  return idx.map((i) => pts[i]);
 }
 
 export function validQuad(q, w, h) {
@@ -304,10 +336,16 @@ export function canonicalQuad(quad) {
  * corners), take the median so a single piece spilling over cannot lie, then
  * ask how cleanly the 64 samples split into the two alternating colours.
  *
- * A correct quad gives a large separation with near-zero spread inside each
+ * The samples are high-passed against their 3x3 neighbourhood before being
+ * compared: on a chessboard every cell is surrounded by four cells of the
+ * opposite colour and four of its own, so the neighbourhood mean is the neutral
+ * level. Dividing by it cancels both the additive and the multiplicative part
+ * of uneven lighting and vignetting, which otherwise swamps the spread on real
+ * cameras (and in the synthetic scenes with light=0.16).
+ *
+ * A correct quad gives a large separation with a small spread inside each
  * class; a quad that is shifted or scaled wrongly mixes board colours with
- * pieces and the spread explodes. The objective is flat within a couple of
- * pixels of the truth, which makes it easy to optimise.
+ * pieces and the spread explodes.
  */
 export function scoreQuad(prepared, w, h, quad) {
   const { gray } = prepared;
@@ -333,9 +371,26 @@ export function scoreQuad(prepared, w, h, quad) {
     }
   }
 
+  // high-pass against the 3x3 neighbourhood
+  const norm = new Float32Array(64);
+  for (let r = 0; r < 8; r++) {
+    for (let f = 0; f < 8; f++) {
+      let s = 0, n = 0;
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let df = -1; df <= 1; df++) {
+          const rr = r + dr, ff = f + df;
+          if (rr < 0 || rr > 7 || ff < 0 || ff > 7) continue;
+          s += vals[rr * 8 + ff]; n++;
+        }
+      }
+      const m = s / n;
+      norm[r * 8 + f] = (vals[r * 8 + f] - m) / (Math.abs(m) + 12);
+    }
+  }
+
   let sa = 0, sb = 0, qa = 0, qb = 0;
   for (let i = 0; i < 64; i++) {
-    const v = vals[i];
+    const v = norm[i];
     if ((i % 8 + (i >> 3)) & 1) { sb += v; qb += v * v; }
     else { sa += v; qa += v * v; }
   }
@@ -344,87 +399,224 @@ export function scoreQuad(prepared, w, h, quad) {
   const sdB = Math.sqrt(Math.max(0, qb / 32 - mB * mB));
   const sep = Math.abs(mA - mB);
 
-  return { h: H, sep, sdA, sdB, mA, mB, score: sep / (1 + sdA + sdB) };
+  return { h: H, sep, sdA, sdB, mA, mB, score: sep / (sdA + sdB + 0.04) };
 }
 
 /* ------------------------------------------------------------------ */
 /* detection                                                           */
 /* ------------------------------------------------------------------ */
 
-function quadFromLines(lines, idx, w, h) {
-  const L = idx.map((i) => lines[i]);
-  // two pairs of near-parallel opposite sides
-  const pairs = [[0, 1, 2, 3], [0, 2, 1, 3], [0, 3, 1, 2]];
-  for (const [a, b, c, d] of pairs) {
-    if (lineAngleDiff(L[a], L[b]) > 25) continue;
-    if (lineAngleDiff(L[c], L[d]) > 25) continue;
-    if (lineAngleDiff(L[a], L[c]) < 35) continue;
-    const corners = [
-      intersectLines(L[a], L[c]),
-      intersectLines(L[a], L[d]),
-      intersectLines(L[b], L[d]),
-      intersectLines(L[b], L[c]),
-    ];
-    if (corners.some((p) => !p)) continue;
-    const q = orderByAngle(corners);
-    if (!validQuad(q, w, h)) continue;
-    return q;
-  }
-  return null;
+
+/** Snap a candidate onto the ridges, then judge it by colour consistency. */
+function refineCandidate(prepared, w, h, quad) {
+  let q = snapQuad(prepared.mag, w, h, quad, 10) || quad;
+  const again = snapQuad(prepared.mag, w, h, q, 3);
+  if (again && validQuad(again, w, h)) q = again;
+  if (!validQuad(q, w, h)) return null;
+  const sc = scoreQuad(prepared, w, h, q);
+  if (!sc) return null;
+  return { quad: q, score: sc.score, sep: sc.sep };
 }
+
+/** Score high enough that no other quad in the frame can plausibly beat it. */
+const DECISIVE = 3.0;
 
 /**
  * Find the most chessboard-looking quad.
  *
- * Hough gives candidate quads that are within a few pixels of the truth but
- * rarely exact, and the colour score is sharply peaked, so the largest
- * candidates are polished first and then compared.
+ * Runs coarse-to-fine over the pyramid and stops at the first scale that
+ * produces a decisive score, which is nearly always the 1/4-scale one: at that
+ * size the inner grid has blurred away and only the board's rim is left, so it
+ * costs one small Hough transform instead of a full-resolution search.
+ *
+ * The colour score is sharply peaked, so Hough candidates (a few pixels out,
+ * and quantised coarser still at 1/4 scale) are always snapped onto their
+ * ridges before being judged.
  *
  * @returns {{quad: number[][], score: number, sep: number}|null}
  */
 export function detectQuad(prepared, w, h) {
-  const cands = candidateQuads(prepared, w, h);
-  if (!cands.length) return null;
-
+  const levels = [
+    [prepared.mag4, prepared.sw4, prepared.sh4],
+    [prepared.mag2, prepared.sw, prepared.sh],
+    [prepared.mag, w, h],
+  ];
   let best = null;
   const tried = [];
-  for (const c of cands) {
-    if (tried.some((t) => meanCornerShift(t, c.quad) < w * 0.03)) continue;
-    tried.push(c.quad);
-    // snap to the ridge under each side, then judge by colour consistency
-    let quad = snapQuad(prepared.mag, w, h, c.quad, 10) || c.quad;
-    const again = snapQuad(prepared.mag, w, h, quad, 3);
-    if (again && validQuad(again, w, h)) quad = again;
-    if (!validQuad(quad, w, h)) continue;
-    const sc = scoreQuad(prepared, w, h, quad);
-    if (sc && (!best || sc.score > best.score)) best = { quad, score: sc.score, sep: sc.sep };
-    if (tried.length >= 6) break;
+
+  for (const [mag, mw, mh] of levels) {
+    const sx = w / mw, sy = h / mh;
+    const list = quadsFromLines(mag, mw, mh, 40);
+    let used = 0;
+    for (const c of list) {
+      if (used >= 4) break;
+      const quad = c.quad.map(([x, y]) => [x * sx, y * sy]);
+      if (tried.some((t) => quadDist(t, quad) < w * 0.02)) continue;
+      tried.push(quad);
+      used++;
+      const r = refineCandidate(prepared, w, h, quad);
+      if (r && (!best || r.score > best.score)) best = r;
+      if (best && best.score >= DECISIVE) return best;
+    }
   }
 
-  if (!best || best.score < 5 || best.sep < 14) return null;
+  if (!best || best.score < 2.5 || best.sep < 0.18) return null;
   return best;
 }
 
-/** Candidate quads from the detected lines, largest first. */
-export function candidateQuads(prepared, w, h, maxLines = 14) {
-  const lines = houghLines(prepared.mag, w, h, maxLines);
+/** Circular distance between two line directions (degrees, both mod 180). */
+function angleDist(a, b) {
+  let d = Math.abs(a - b) % 180;
+  return d > 90 ? 180 - d : d;
+}
+
+/**
+ * Find the two dominant directions in a line set.
+ *
+ * A chessboard is two families of roughly parallel lines about 90 degrees
+ * apart, so one round of weighted voting finds the stronger family and the
+ * second is simply perpendicular to it. Perspective makes the members of a
+ * family converge by up to ~20 degrees, hence the wide kernel.
+ */
+function dominantDirections(lines) {
+  let best = null;
+  for (const l of lines) {
+    let acc = 0;
+    for (const o of lines) acc += Math.max(0, 1 - angleDist(l.theta, o.theta) / 26);
+    if (!best || acc > best.acc) best = { theta: l.theta, acc };
+  }
+  const t1 = best ? best.theta : 0;
+  let best2 = null;
+  for (const l of lines) {
+    if (angleDist(l.theta, t1) < 30) continue;
+    let acc = 0;
+    for (const o of lines) {
+      if (angleDist(o.theta, t1) < 30) continue;
+      acc += Math.max(0, 1 - angleDist(l.theta, o.theta) / 26);
+    }
+    if (!best2 || acc > best2.acc) best2 = { theta: l.theta, acc };
+  }
+  if (!best2) return [t1, t1 + 90];
+  return [t1, best2.theta];
+}
+
+/**
+ * Candidate quads in the coordinate space of `mag`, which may be a pyramid
+ * level. Returns quads sorted by board-likeness, largest first.
+ */
+function quadsFromLines(mag, mw, mh, maxLines) {
+  const lines = houghLines(mag, mw, mh, maxLines);
   if (lines.length < 4) return [];
-  const n = lines.length;
-  const cands = [];
-  // all 4-subsets: which lines oppose each other is decided in quadFromLines
-  for (let a = 0; a < n; a++) {
-    for (let b = a + 1; b < n; b++) {
-      for (let c = b + 1; c < n; c++) {
-        for (let d = c + 1; d < n; d++) {
-          const quad = quadFromLines(lines, [a, b, c, d], w, h);
-          if (!quad) continue;
-          cands.push({ quad, area: quadArea(quad) });
-        }
+
+  const [t1, t2] = dominantDirections(lines);
+  const famA = [], famB = [];
+  for (const l of lines) {
+    const dA = angleDist(l.theta, t1), dB = angleDist(l.theta, t2);
+    if (Math.min(dA, dB) > 26) continue;
+    (dA <= dB ? famA : famB).push(l);
+  }
+  if (famA.length < 2 || famB.length < 2) return [];
+
+  // A board side spans several cells, so opposite lines must be far apart.
+  // Dropping near-coincident pairs removes most of the 40-choose-2 combinations
+  // (the grid lines of a small board are only ~1 cell apart) before any work.
+  const minSep = Math.min(mw, mh) * 0.22;
+  const pairsOf = (fam) => {
+    const out = [];
+    for (let i = 0; i < fam.length; i++) {
+      for (let j = i + 1; j < fam.length; j++) {
+        if (Math.abs(fam[i].rho - fam[j].rho) < minSep) continue;
+        out.push([i, j]);
       }
+    }
+    return out;
+  };
+  const pA = pairsOf(famA), pB = pairsOf(famB);
+  if (!pA.length || !pB.length) return [];
+
+  // every crossing point, computed once
+  const X = famA.map((a) => famB.map((b) => intersectLines(a, b)));
+
+  const cands = [];
+  for (const [a, b] of pA) {
+    for (const [c, d] of pB) {
+      const p0 = X[a][c], p1 = X[a][d], p2 = X[b][d], p3 = X[b][c];
+      if (!p0 || !p1 || !p2 || !p3) continue;
+      const q = orderByAngle([p0, p1, p2, p3]);
+      if (!validQuad(q, mw, mh)) continue;
+      const rank = quadRank(q);
+      if (!rank) continue;
+      cands.push({ quad: q, area: rank });
     }
   }
   cands.sort((x, y) => y.area - x.area);
   return cands;
+}
+
+/**
+ * Candidate quads from the detected lines, largest first.
+ *
+ * A chessboard is two families of near-parallel lines about 90 degrees apart,
+ * so the lines are split those two families and every pair of one is crossed
+ * with every pair of the other. Enumerating all 4-subsets cannot work: 24
+ * choose 4 quads is far too many to snap and score, and it is the pairing that
+ * carries the meaning anyway.
+ */
+export function candidateQuads(prepared, w, h) {
+  const out = [];
+  const seen = [];
+  const push = (list, sx, sy) => {
+    for (const c of list) {
+      const quad = c.quad.map(([x, y]) => [x * sx, y * sy]);
+      if (seen.some((s) => quadDist(s, quad) < w * 0.02)) continue;
+      seen.push(quad);
+      out.push({ quad, area: quadArea(quad) });
+    }
+  };
+  // coarse first: at 1/4 scale the inner grid has averaged away and the rim is
+  // the strongest structure in the image
+  push(quadsFromLines(prepared.mag4, prepared.sw4, prepared.sh4, 40), w / prepared.sw4, h / prepared.sh4);
+  push(quadsFromLines(prepared.mag2, prepared.sw, prepared.sh, 40), w / prepared.sw, h / prepared.sh);
+  if (!out.length) push(quadsFromLines(prepared.mag, w, h, 40), 1, 1);
+  out.sort((a, b) => b.area - a.area);
+  return out;
+}
+
+/** Mean corner distance between two cyclic quads, ignoring where they start. */
+function quadDist(a, b) {
+  let best = Infinity;
+  for (let k = 0; k < 4; k++) {
+    let s = 0;
+    for (let i = 0; i < 4; i++) {
+      const p = a[i], q = b[(i + k) % 4];
+      s += Math.hypot(p[0] - q[0], p[1] - q[1]);
+    }
+    best = Math.min(best, s / 4);
+  }
+  return best;
+}
+
+/**
+ * Cheap shape prior for "could this be a chessboard seen in perspective?".
+ *
+ * Returns a ranking weight (bigger is better) or 0 for shapes no camera could
+ * turn a square into: opposite sides must be comparable and the aspect ratio
+ * must stay square-ish. This is deliberately loose; the colour score does the
+ * real work.
+ */
+function quadRank(q) {
+  const len = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i++) {
+    len[i] = Math.hypot(q[(i + 1) % 4][0] - q[i][0], q[(i + 1) % 4][1] - q[i][1]);
+  }
+  const h1 = (len[0] + len[2]) / 2, h2 = (len[1] + len[3]) / 2;
+  if (Math.min(h1, h2) < 8) return 0;
+  // opposite sides should not differ wildly (perspective shortens a far side)
+  if (Math.abs(len[0] - len[2]) / Math.max(len[0], len[2]) > 0.6) return 0;
+  if (Math.abs(len[1] - len[3]) / Math.max(len[1], len[3]) > 0.6) return 0;
+  const ar = h1 / h2;
+  if (ar < 0.5 || ar > 2.0) return 0;
+  return quadArea(q) * Math.min(1, 1.6 - Math.abs(Math.log(ar)));
 }
 
 /**
@@ -443,28 +635,42 @@ function snapLine(mag, w, h, a, b, range = 9) {
   const half = Math.max(6, L / 2 - 4);
   const stepT = Math.max(2, L / 22);
 
-  let best = null;
-  const angles = [0, -0.02, 0.02, -0.04, 0.04, -0.06, 0.06];
-  const offsets = [];
-  for (let o = -range; o <= range + 0.01; o += range / 6) offsets.push(o);
-
-  for (const ang of angles) {
+  const scoreAt = (ang, off) => {
     const c = Math.cos(ang), s = Math.sin(ang);
     const vx = ux * c - uy * s, vy = ux * s + uy * c;
     const nx = -vy, ny = vx;
-    for (const off of offsets) {
-      let sum = 0, n = 0;
-      for (let t = -half; t <= half; t += stepT) {
-        const v = sampleBilinear(mag, w, h, mx + nx * off + vx * t, my + ny * off + vy * t);
-        if (v === null) continue;
-        sum += Math.min(v, 700); n++;
-      }
-      if (!n) continue;
-      const sc = sum / n;
-      if (!best || sc > best.sc) best = { sc, vx, vy, px: mx + nx * off, py: my + ny * off };
+    let sum = 0, n = 0;
+    for (let t = -half; t <= half; t += stepT) {
+      const v = sampleBilinear(mag, w, h, mx + nx * off + vx * t, my + ny * off + vy * t);
+      if (v === null) continue;
+      sum += Math.min(v, 700); n++;
+    }
+    return n ? sum / n : 0;
+  };
+
+  // coarse over angle and offset, then a fine pass at half-pixel resolution so
+  // the grid does not jitter between frames
+  let best = null;
+  const dOff = range / 4;
+  for (let ai = -3; ai <= 3; ai++) {
+    for (let oi = -4; oi <= 4; oi++) {
+      const ang = ai * 0.02, off = oi * dOff;
+      const sc = scoreAt(ang, off);
+      if (!best || sc > best.sc) best = { sc, ang, off };
     }
   }
-  return best;
+  const fineO = range / 16;
+  for (let ai = -2; ai <= 2; ai++) {
+    for (let oi = -2; oi <= 2; oi++) {
+      const ang = best.ang + ai * 0.008, off = best.off + oi * fineO;
+      const sc = scoreAt(ang, off);
+      if (sc > best.sc) best = { sc, ang, off };
+    }
+  }
+
+  const c = Math.cos(best.ang), s = Math.sin(best.ang);
+  const vx = ux * c - uy * s, vy = ux * s + uy * c;
+  return { sc: best.sc, vx, vy, px: mx + -vy * best.off, py: my + vx * best.off };
 }
 
 /** Snap all four sides and re-intersect them. */
@@ -598,21 +804,53 @@ export function cellCenter(H, f, r) {
 /* square descriptors                                                  */
 /* ------------------------------------------------------------------ */
 
+/** Pre-multiply a homography's output by (sx, sy), for sampling a smaller image. */
+export function scaleHomography(H, sx, sy) {
+  return [
+    H[0] * sx, H[1] * sx, H[2] * sx,
+    H[3] * sy, H[4] * sy, H[5] * sy,
+    H[6], H[7], H[8],
+  ];
+}
+
 /**
- * 64 squares x 3x3 luminance samples, indexed rank-major (a1 = 0).
- * Used for frame-to-frame difference and move inference.
+ * Square descriptor: 3x3 patch means per square, sampled at full resolution.
+ *
+ * Brightness alone is not enough — a white pawn on a light square barely moves
+ * the mean of the square — so the 3x3 layout is kept and compared with an RMS
+ * difference, which responds to the *structure* a piece adds.
+ *
+ * This is only stable because the tracker freezes the sampling grid while the
+ * board is not moving; see BoardTracker.
  */
-export function describeSquares(gray, w, h, H) {
+export function describeBoard(prepared, w, h, H) {
+  return describeSquares(prepared.gray, w, h, H, 0.05);
+}
+
+/**
+ * 64 squares x 3x3 samples, indexed rank-major (a1 = 0).
+ *
+ * `patch` is the half-width, in squares, of the little box averaged around each
+ * sample; 0 means a single bilinear sample.
+ */
+export function describeSquares(gray, w, h, H, patch = 0) {
   const out = new Float32Array(64 * 9);
   const offs = [0.25, 0.5, 0.75];
+  const steps = patch > 0 ? [-patch, 0, patch] : [0];
   for (let r = 0; r < 8; r++) {
     for (let f = 0; f < 8; f++) {
       const base = (r * 8 + f) * 9;
       for (let i = 0; i < 3; i++) {
         for (let j = 0; j < 3; j++) {
-          const p = project(H, f + offs[j], r + offs[i]);
-          const v = p ? sampleBilinear(gray, w, h, p[0], p[1]) : null;
-          out[base + i * 3 + j] = v === null ? 0 : v;
+          let sum = 0, n = 0;
+          for (const sy of steps) {
+            for (const sx of steps) {
+              const p = project(H, f + offs[j] + sx, r + offs[i] + sy);
+              const v = p ? sampleBilinear(gray, w, h, p[0], p[1]) : null;
+              if (v !== null) { sum += v; n++; }
+            }
+          }
+          out[base + i * 3 + j] = n ? sum / n : 0;
         }
       }
     }
@@ -620,17 +858,29 @@ export function describeSquares(gray, w, h, H) {
   return out;
 }
 
-/** Per-square RMS difference between two descriptors (0..255). */
+/**
+ * Per-square difference between two descriptors (0..255).
+ *
+ * Two terms are combined: the RMS difference of the nine patch means (catches
+ * brightness) and the RMS difference *after* removing each square's own mean
+ * (catches shape). The second is what makes a white pawn on a light square
+ * visible: overall brightness barely moves, but the 3x3 pattern does.
+ */
 export function squareDiff(a, b) {
   const out = new Float32Array(64);
   for (let s = 0; s < 64; s++) {
-    let acc = 0;
     const base = s * 9;
+    let m1 = 0, m2 = 0;
+    for (let k = 0; k < 9; k++) { m1 += a[base + k]; m2 += b[base + k]; }
+    m1 /= 9; m2 /= 9;
+    let flat = 0, shape = 0;
     for (let k = 0; k < 9; k++) {
       const d = a[base + k] - b[base + k];
-      acc += d * d;
+      const s1 = (a[base + k] - m1) - (b[base + k] - m2);
+      flat += d * d;
+      shape += s1 * s1;
     }
-    out[s] = Math.sqrt(acc / 9);
+    out[s] = Math.max(Math.sqrt(flat / 9), Math.sqrt(shape / 9) * 1.6);
   }
   return out;
 }
@@ -650,7 +900,7 @@ export function median(arr) {
  * and keeps the AR overlay glued to the board.
  */
 export class BoardTracker {
-  constructor({ side = 'w', detectEvery = 4 } = {}) {
+  constructor({ side = 'w', detectEvery = 12 } = {}) {
     this.side = side;
     this.detectEvery = detectEvery;
     this.quad = null;
@@ -658,6 +908,8 @@ export class BoardTracker {
     this.score = 0;
     this.tick = 0;
     this.misses = 0;
+    this.badFrames = 0;
+    this.prevSmall = null;
     this.redetected = false;
     this.frames = 0;
   }
@@ -667,7 +919,9 @@ export class BoardTracker {
     this.H = null;
     this.score = 0;
     this.misses = 0;
+    this.badFrames = 0;
     this.tick = 0;
+    this.prevSmall = null;
   }
 
   get locked() {
@@ -682,34 +936,94 @@ export class BoardTracker {
     const prepared = prepare(grayFromRGBA(rgba, w, h), w, h);
     this.frames++;
     this.redetected = false;
+    const quadBefore = this.quad;
 
-    const due = !this.quad || this.tick++ % this.detectEvery === 0;
-    if (due) {
-      const det = detectQuad(prepared, w, h);
-      if (det) {
-        this.misses = 0;
-        this.redetected = true;
-        const close = this.quad && meanCornerShift(this.quad, det.quad) < w * 0.1;
-        const base = close ? blendQuad(this.quad, det.quad, 0.5) : det.quad;
-        this.quad = refineQuad(prepared, w, h, base, { inset: !close, passes: close ? 1 : 3 });
-        this.score = scoreQuad(prepared, w, h, this.quad)?.score || 0;
-      } else if (this.quad) {
-        this.misses++;
-        if (this.misses > 8) this.reset();
+    // If the scene has not moved there is nothing to re-fit: freezing the quad
+    // is what keeps the sampling grid (and therefore the square descriptors)
+    // stable while the phone is held still.
+    const motion = frameMotion(prepared.gray4, this.prevSmall, prepared.sw4, prepared.sh4);
+    this.prevSmall = prepared.gray4;
+    const still = motion < 2;
+
+    if (!(this.quad && still)) {
+      // Re-detect only when something actually suggests the lock is stale:
+      // losing the score, a big jump, or a slow heartbeat. Re-detecting on a
+      // healthy lock just makes the grid jump around.
+      const due = !this.quad || this.score < 3
+        || this.tick++ % this.detectEvery === 0;
+      if (due) {
+        const det = detectQuad(prepared, w, h);
+        if (det) {
+          this.misses = 0;
+          this.redetected = true;
+          // If the detection lands on the board we already have, keep the
+          // existing lock: re-seating the grid by a pixel for no reason is what
+          // made every square look like it had changed.
+          const close = this.quad && meanCornerShift(this.quad, det.quad) < w * 0.02;
+          if (!close) this.quad = refineQuad(prepared, w, h, det.quad, { inset: true, passes: 3 });
+          const sc = scoreQuad(prepared, w, h, this.quad);
+          if (sc) this.score = sc.score;
+        } else if (this.quad) {
+          this.misses++;
+          if (this.misses > 4) this.reset();
+        }
       }
-    }
 
-    if (this.quad) {
-      const refined = refineQuad(prepared, w, h, this.quad, { passes: 1 });
-      if (refined && validQuad(refined, w, h)) {
-        this.quad = blendQuad(this.quad, refined, 0.6);
-        this.score = scoreQuad(prepared, w, h, this.quad)?.score || 0;
+      if (this.quad && this.score < 4) {
+        // Only re-fit when the lock is starting to slip. A well-locked, static
+        // board must not be re-fitted at all: the snap can hop a few pixels onto
+        // a decorative border, and that silently poisons every square diff.
+        const refined = refineQuad(prepared, w, h, this.quad, { passes: 1 });
+        if (refined && validQuad(refined, w, h)) {
+          const sc = scoreQuad(prepared, w, h, refined);
+          if (sc && sc.score > 2.2) {
+            // only follow the ridge when it actually moved: re-fitting a static
+            // board on every frame is what makes the sampling grid wobble
+            if (meanCornerShift(this.quad, refined) > 0.6) this.quad = refined;
+            this.score = sc.score;
+            this.badFrames = 0;
+          } else if (++this.badFrames > 3) {
+            // the board is gone or the camera swung away: drop the lock so the
+            // next frame does a fresh search
+            this.reset();
+          }
+        }
       }
     }
 
     this.H = this.quad ? boardHomography(this.quad, this.side) : null;
-    return { quad: this.quad, H: this.H, score: this.score, redetected: this.redetected };
+    // how far the sampling grid moved this frame: callers must not compare
+    // square descriptors across a grid change
+    this.quadShift = quadBefore && this.quad ? meanCornerShift(quadBefore, this.quad) : 0;
+    return {
+      quad: this.quad, H: this.H, score: this.score, quadShift: this.quadShift,
+      redetected: this.redetected, motion, prepared,
+    };
   }
+}
+
+/**
+ * Largest mean absolute difference over 8x8 blocks of the 1/4-scale image.
+ *
+ * A moving piece lights up one or two blocks strongly; sensor noise averages
+ * out inside a block. This is the cheap "did anything change" test.
+ */
+function frameMotion(a, b, sw, sh) {
+  if (!b || !a) return Infinity;
+  let worst = 0;
+  for (let by = 0; by < sh; by += 8) {
+    const y1 = Math.min(by + 8, sh);
+    for (let bx = 0; bx < sw; bx += 8) {
+      const x1 = Math.min(bx + 8, sw);
+      let s = 0, n = 0;
+      for (let y = by; y < y1; y++) {
+        const row = y * sw;
+        for (let x = bx; x < x1; x++) { s += Math.abs(a[row + x] - b[row + x]); n++; }
+      }
+      if (n && s / n > worst) worst = s / n;
+    }
+  }
+  return worst;
 }
 
 function meanCornerShift(a, b) {

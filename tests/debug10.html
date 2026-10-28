@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>debug10 · render determinism</title>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}canvas{border:1px solid #444}pre{white-space:pre}</style>
+</head><body>
+<canvas id="c"></canvas>
+<pre id="out"></pre>
+<script type="module">
+import { BoardTracker, describeBoard, squareDiff } from '../js/vision.js';
+import { renderScene, makePose } from './scene.js';
+import { indexSquare } from '../js/track.js';
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 640), H = +(qp.get('h') || 360);
+const cv = document.getElementById('c'); cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const L = [];
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n'); };
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const quad = makePose(W, H, { tilt: 0.26, size: Math.min(W, H) * 0.8 });
+const tracker = new BoardTracker({ side: 'w' });
+
+renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.04, noise: 9, seed: 3 });
+let res = tracker.update(ctx.getImageData(0, 0, W, H).data, W, H);
+const H0 = res.H;
+const d0 = describeBoard(res.prepared, W, H, H0);
+
+const top = (d, n = 10) => [...d].map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, n)
+  .map(([v, i]) => `${indexSquare(i)}=${v.toFixed(1)}`).join(' ');
+
+for (const [label, seed, nz, fen] of [
+  ['same seed', 3, 9, START],
+  ['new seed', 77, 9, START],
+  ['no noise', 3, 0, START],
+  ['new seed, no noise', 77, 0, START],
+  ['after e4, same seed', 3, 9, 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'],
+  ['after e4, new seed', 77, 9, 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'],
+]) {
+  renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: nz, seed });
+  const r2 = tracker.update(ctx.getImageData(0, 0, W, H).data, W, H);
+  const d2 = describeBoard(r2.prepared, W, H, r2.H);
+  const df = squareDiff(d2, d0);
+  log(`${label.padEnd(20)} motion=${r2.motion.toFixed(2)} quadShift?=${r2.redetected} max=${Math.max(...df).toFixed(1)}`);
+  log('   ' + top(df, 8));
+}
+
+// how big is the quad shift caused by a re-detect?
+log('');
+renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.04, noise: 9, seed: 3 });
+const before = tracker.quad.map((p) => p.slice());
+for (let i = 0; i < 14; i++) tracker.update(ctx.getImageData(0, 0, W, H).data, W, H);
+const after = tracker.quad;
+log('quad drift over 14 static frames: ' + before.map((p, i) => Math.hypot(p[0] - after[i][0], p[1] - after[i][1]).toFixed(2)).join(', '));
+// pure renderer + descriptor test: same H, no tracker involvement
+log('\n(descriptor only, fixed H)');
+const { describeSquares } = await import('../js/vision.js');
+const { grayFromRGBA } = await import('../js/vision.js');
+const fix = (fen, seed, nz) => {
+  renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: nz, seed });
+  return describeSquares(grayFromRGBA(ctx.getImageData(0, 0, W, H).data, W, H), W, H, H0, 0.05);
+};
+const ref = fix(START, 3, 9);
+for (const [lab, fen, seed, nz] of [
+  ['same', START, 3, 9],
+  ['seed only', START, 77, 9],
+  ['fen only', 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1', 3, 9],
+  ['fen + seed', 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1', 77, 9],
+  ['fen, no noise', 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1', 3, 0],
+]) {
+  const d = squareDiff(fix(fen, seed, nz), ref);
+  log(`${lab.padEnd(14)} max=${Math.max(...d).toFixed(1)} med=${[...d].sort((a, b) => a - b)[32].toFixed(1)}  ${top(d, 6)}`);
+}
+
+window.__done = true;
+</script></body></html>

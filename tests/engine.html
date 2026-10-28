@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>engine test</title>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}pre{white-space:pre-wrap}</style>
+</head><body>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; };
+
+const worker = new Worker('../js/engine.js', { type: 'module' });
+const cases = [
+  ['start', 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'],
+  ['mate in 1', '6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1'],
+  ['take the queen', 'rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3'],
+  ['black to move', 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'],
+];
+
+let i = 0;
+const next = () => {
+  if (i >= cases.length) { window.__done = true; return; }
+  const [name, fen] = cases[i++];
+  const t0 = performance.now();
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'info') { log(`  ${name} depth ${m.depth} score ${m.score} nodes ${m.nodes}`); return; }
+    if (m.type === 'best') {
+      log(`${name.padEnd(18)} ${m.san} (score ${m.score}, depth ${m.depth}, ${m.nodes} nodes, ${(performance.now() - t0).toFixed(0)} ms)`);
+      next();
+    }
+  };
+  worker.postMessage({ type: 'think', fen, ms: 800 });
+};
+next();
+</script></body></html>

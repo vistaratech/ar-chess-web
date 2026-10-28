@@ -16,7 +16,7 @@
 <script type="module">
 import { Chess } from '../vendor/chess.js';
 import {
-  BoardTracker, boardHomography, describeSquares, grayFromRGBA, project, scoreQuad, squareDiff, median, prepare,
+  BoardTracker, boardHomography, describeBoard, describeSquares, grayFromRGBA, project, scoreQuad, squareDiff, median, prepare,
 } from '../js/vision.js';
 import { renderScene, makePose } from './scene.js';
 import { MoveReader, inferMove, indexSquare } from '../js/track.js';
@@ -101,7 +101,7 @@ for (const side of ['w', 'b']) {
   const gray = grayFromRGBA(rgba, W, H);
   const tr = new BoardTracker({ side });
   const res = tr.update(rgba, W, H);
-  const desc = describeSquares(gray, W, H, res.H);
+  const desc = describeBoard(res.prepared, W, H, res.H);
   const mean = (i) => { let s = 0; for (let k = 0; k < 9; k++) s += desc[i * 9 + k]; return s / 9; };
   const rank1 = Array.from({ length: 8 }, (_, i) => mean(i).toFixed(0)).join(' ');
   const good = mean(0) < mean(7);
@@ -119,7 +119,7 @@ log('\n=== 2b. stability (same frame x8) ===');
   for (let i = 0; i < 8; i++) {
     const res = tr.update(bytes, W, H);
     const gray = grayFromRGBA(bytes, W, H);
-    const d = res.H ? describeSquares(gray, W, H, res.H) : null;
+    const d = res.H ? describeBoard(res.prepared, W, H, res.H) : null;
     if (prev && d) {
       const df = squareDiff(d, prev);
       log(`  frame ${i}: medDiff=${median(df).toFixed(2)} max=${Math.max(...df).toFixed(1)} quadErr=${quadError(res.quad, quad).toFixed(1)}px`);
@@ -142,35 +142,37 @@ renderScene(ctx, { w: W, h: H, fen: game.fen(), quad, border: 0.02, light: 0.04,
 let rgba = frame();
 let res = tracker.update(rgba, W, H);
 let gray = grayFromRGBA(rgba, W, H);
-reader.commit(describeSquares(gray, W, H, res.H));
+reader.commit(describeBoard(res.prepared, W, H, res.H));
 
 let pass = 0;
 for (const san of moves) {
+  const legal = game.moves({ verbose: true });   // position *before* the move
   const want = game.move(san);
   renderScene(ctx, { w: W, h: H, fen: game.fen(), quad, border: 0.02, light: 0.04, noise: 9 + Math.random() * 3, seed: 3 + moves.indexOf(san) });
   let got = null, note = '';
+  const trace = [];
   for (let f = 0; f < 3; f++) {
     rgba = frame();
     res = tracker.update(rgba, W, H);
     gray = grayFromRGBA(rgba, W, H);
-    const desc = res.H ? describeSquares(gray, W, H, res.H) : null;
+    const desc = res.H ? describeBoard(res.prepared, W, H, res.H) : null;
     if (!desc) { note = 'no board'; continue; }
-    const r = reader.push(desc);
+    const r = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
+    trace.push(`f${f}:qs${res.quadShift.toFixed(2)}:mt${res.motion.toFixed(0)}:n${r.changed.size}${r.settled ? 'S' : ''}${r.rebased ? 'R' : ''}`);
     if (!r.settled) continue;
-    const inf = inferMove(game.moves({ verbose: true }), r.changed);
+    const inf = inferMove(legal, r.changed);
     if (inf.accepted) {
       got = inf.move;
       reader.commit(desc);
-      game.move({ from: inf.move.from, to: inf.move.to, promotion: 'q' });
       break;
     }
     note = `changed=${[...r.changed].map(indexSquare).join(',')} best=${inf.best ? inf.best.move.san : '-'} score=${inf.best ? inf.best.score.toFixed(2) : '-'} margin=${isFinite(inf.margin) ? inf.margin.toFixed(2) : 'inf'}`
-      + (inf.ambiguous ? ' ambiguous' : '');
+      + (inf.ambiguous ? ' ambiguous' : '') + ' ' + trace.join(' ');
     reader.commit(desc);
   }
   const okMove = got && got.from === want.from && got.to === want.to;
   if (okMove) pass++;
-  log(`${san.padEnd(6)} want=${want.from}${want.to} got=${got ? got.from + got.to : '---'} ${okMove ? 'ok' : 'FAIL ' + note}`);
+  log(`${san.padEnd(6)} want=${want.from}${want.to} got=${got ? got.from + got.to : '---'} ${okMove ? 'ok' : 'FAIL ' + (note || trace.join(' '))}`);
 }
 log(`move reading: ${pass}/${moves.length}`);
 log('\ndone');
