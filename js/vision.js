@@ -64,16 +64,114 @@ export function invert3(m) {
 /* image helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * RGBA -> luminance. Integer arithmetic (Rec.601 in 8.8 fixed point): the
+ * float version cost 1.5 ms per 640x360 frame, this is about a third of that.
+ */
 export function grayFromRGBA(rgba, w, h) {
   const out = new Float32Array(w * h);
   for (let i = 0, p = 0; i < out.length; i++, p += 4) {
-    out[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+    out[i] = (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
   }
   return out;
 }
 
-function blur121(src, w, h) {
-  const tmp = new Float32Array(w * h);
+/**
+ * Quarter-scale luminance taken straight from the RGBA buffer, with a diff
+ * against the previous frame.
+ *
+ * This is the cheap "has anything moved" test that lets a still camera skip all
+ * of the vision work: four samples per 4x4 block average the sensor noise away,
+ * so a genuine change (a piece, a camera nudge) stands out clearly while a
+ * static scene compares at exactly zero.
+ */
+export function thumbFromRGBA(rgba, w, h, prev, prevW, prevH) {
+  const tw = Math.max(1, w >> 2), th = Math.max(1, h >> 2);
+  const out = new Float32Array(tw * th);
+  for (let y = 0; y < th; y++) {
+    const r0 = (4 * y) * w, r1 = (4 * y + 2) * w;
+    for (let x = 0; x < tw; x++) {
+      const c0 = 4 * x, c1 = 4 * x + 2;
+      const a = (r0 + c0) * 4, b = (r0 + c1) * 4, c = (r1 + c0) * 4, d = (r1 + c1) * 4;
+      const v = (
+        (77 * rgba[a] + 150 * rgba[a + 1] + 29 * rgba[a + 2]) +
+        (77 * rgba[b] + 150 * rgba[b + 1] + 29 * rgba[b + 2]) +
+        (77 * rgba[c] + 150 * rgba[c + 1] + 29 * rgba[c + 2]) +
+        (77 * rgba[d] + 150 * rgba[d + 1] + 29 * rgba[d + 2])
+      ) / 1024;
+      out[y * tw + x] = v;
+    }
+  }
+
+  // Compare 4x4 thumb blocks (16x16 image pixels). Averaging a block first is
+  // what makes this usable on a real sensor: the per-pixel noise of a still
+  // camera averages down to a fraction of a level, while a piece or a one-pixel
+  // camera nudge still moves a block clearly.
+  let worst = 0;
+  if (prev && prevW === tw && prevH === th) {
+    for (let by = 0; by < th; by += 4) {
+      const y1 = Math.min(by + 4, th);
+      for (let bx = 0; bx < tw; bx += 4) {
+        const x1 = Math.min(bx + 4, tw);
+        let s = 0, n = 0;
+        for (let y = by; y < y1; y++) {
+          const row = y * tw;
+          for (let x = bx; x < x1; x++) { s += Math.abs(out[row + x] - prev[row + x]); n++; }
+        }
+        const m = s / n;
+        if (m > worst) worst = m;
+      }
+    }
+  } else {
+    worst = Infinity;
+  }
+  return { thumb: out, tw, th, motion: worst };
+}
+
+/* ------------------------------------------------------------------ */
+/* per-frame buffers                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Two scratch sets per resolution. Two, not one, because a caller may still be
+ * reading the descriptor of the previous frame while the next one is being
+ * prepared; with a single set that frame's data would be overwritten in place.
+ * Everything is reused afterwards, so a running camera allocates nothing per
+ * frame and the garbage collector never has a reason to interrupt the loop.
+ */
+const pools = new Map();
+
+function poolFor(w, h) {
+  const key = w + 'x' + h;
+  let e = pools.get(key);
+  if (e) return e;
+  const sw = Math.max(1, w >> 1), sh = Math.max(1, h >> 1);
+  const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
+  e = { w, h, sw, sh, sw4, sh4, next: 0, slots: [] };
+  for (let i = 0; i < 2; i++) {
+    e.slots.push({
+      rgbaGray: new Float32Array(w * h),
+      tmp: new Float32Array(w * h),
+      gray: new Float32Array(w * h),
+      mag: new Float32Array(w * h),
+      gray2: new Float32Array(sw * sh),
+      mag2: new Float32Array(sw * sh),
+      gray4: new Float32Array(sw4 * sh4),
+      mag4: new Float32Array(sw4 * sh4),
+    });
+  }
+  pools.set(key, e);
+  return e;
+}
+
+function darken(rgba, w, h, out) {
+  for (let i = 0, p = 0; i < out.length; i++, p += 4) {
+    out[i] = (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
+  }
+  return out;
+}
+
+function blur121Into(src, tmp, out, w, h) {
   for (let y = 0; y < h; y++) {
     const row = y * w;
     for (let x = 0; x < w; x++) {
@@ -83,7 +181,6 @@ function blur121(src, w, h) {
       tmp[row + x] = (l + 2 * c + r) * 0.25;
     }
   }
-  const out = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
     const up = (y > 0 ? y - 1 : 0) * w;
     const row = y * w;
@@ -95,8 +192,19 @@ function blur121(src, w, h) {
   return out;
 }
 
-function sobelMagnitude(src, w, h) {
-  const out = new Float32Array(w * h);
+function halveInto(src, w, h, out, ow, oh) {
+  for (let y = 0; y < oh; y++) {
+    const s0 = (2 * y) * w, s1 = s0 + w;
+    const row = y * ow;
+    for (let x = 0; x < ow; x++) {
+      const i = 2 * x;
+      out[row + x] = 0.25 * (src[s0 + i] + src[s0 + i + 1] + src[s1 + i] + src[s1 + i + 1]);
+    }
+  }
+  return out;
+}
+
+function sobelInto(src, out, w, h) {
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const i = y * w + x;
@@ -111,38 +219,45 @@ function sobelMagnitude(src, w, h) {
   return out;
 }
 
-/**
- * Blur + edge magnitude at full and half resolution.
- *
- * The half-resolution pyramid is what makes the board's *rim* findable: a
- * half-pixel grid line mostly averages away, while the step between the board
- * and the table survives. Hough on the full-res image instead tends to return
- * the inner grid (and the rows of pieces), and then the outer edge never
- * becomes a candidate.
- */
-export function prepare(grayIn, w, h) {
-  const gray = blur121(grayIn, w, h);
-  const mag = sobelMagnitude(gray, w, h);
-  const sw = Math.max(1, w >> 1), sh = Math.max(1, h >> 1);
-  const gray2 = new Float32Array(sw * sh);
-  for (let y = 0; y < sh; y++) {
-    for (let x = 0; x < sw; x++) {
-      const i = 2 * y * w + 2 * x;
-      gray2[y * sw + x] = 0.25 * (gray[i] + gray[i + 1] + gray[i + w] + gray[i + w + 1]);
-    }
-  }
-  const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
-  const gray4 = new Float32Array(sw4 * sh4);
-  for (let y = 0; y < sh4; y++) {
-    for (let x = 0; x < sw4; x++) {
-      const i = 2 * y * sw + 2 * x;
-      gray4[y * sw4 + x] = 0.25 * (gray2[i] + gray2[i + 1] + gray2[i + sw] + gray2[i + sw + 1]);
-    }
-  }
+function prepareInto(src, w, h, e, slot) {
+  const { sw, sh, sw4, sh4 } = e;
+  const gray = blur121Into(src, slot.tmp, slot.gray, w, h);
+  const gray2 = halveInto(gray, w, h, slot.gray2, sw, sh);
+  const gray4 = halveInto(gray2, sw, sh, slot.gray4, sw4, sh4);
+  // Gradients are the expensive part (a full-res Sobel is several ms) and only
+  // detection/refinement need them, so they are built on first access: a frame
+  // that is merely tracked and sampled pays nothing for them.
+  let mag = null, mag2 = null, mag4 = null;
   return {
-    gray, mag, sw, sh, gray2, mag2: sobelMagnitude(gray2, sw, sh),
-    sw4, sh4, gray4, mag4: sobelMagnitude(gray4, sw4, sh4),
+    gray, sw, sh, gray2, sw4, sh4, gray4,
+    get mag() { return mag || (mag = sobelInto(gray, slot.mag, w, h)); },
+    get mag2() { return mag2 || (mag2 = sobelInto(gray2, slot.mag2, sw, sh)); },
+    get mag4() { return mag4 || (mag4 = sobelInto(gray4, slot.mag4, sw4, sh4)); },
   };
+}
+
+/** Prepare a frame from luminance, allocating (tests, one-off analysis). */
+export function prepare(grayIn, w, h) {
+  const e = poolFor(w, h);
+  const slot = {
+    tmp: new Float32Array(w * h), gray: new Float32Array(w * h),
+    mag: new Float32Array(w * h),
+    gray2: new Float32Array(e.sw * e.sh), mag2: new Float32Array(e.sw * e.sh),
+    gray4: new Float32Array(e.sw4 * e.sh4), mag4: new Float32Array(e.sw4 * e.sh4),
+  };
+  return prepareInto(grayIn, w, h, e, slot);
+}
+
+/**
+ * Prepare a frame straight from the camera's RGBA buffer, writing into the
+ * rotating scratch set. The returned buffers stay valid until two more frames
+ * have been prepared at the same size.
+ */
+export function prepareFrame(rgba, w, h) {
+  const e = poolFor(w, h);
+  const slot = e.slots[e.next++ % e.slots.length];
+  darken(rgba, w, h, slot.rgbaGray);
+  return prepareInto(slot.rgbaGray, w, h, e, slot);
 }
 
 function percentileFromHistogram(hist, total, q) {
@@ -634,13 +749,14 @@ function snapLine(mag, w, h, a, b, range = 9) {
   const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
   const half = Math.max(6, L / 2 - 4);
   const stepT = Math.max(2, L / 22);
+  const nS = Math.floor((2 * half) / stepT) + 1;
 
-  const scoreAt = (ang, off) => {
-    const c = Math.cos(ang), s = Math.sin(ang);
+  const scoreAt = (c, s, off) => {
     const vx = ux * c - uy * s, vy = ux * s + uy * c;
     const nx = -vy, ny = vx;
     let sum = 0, n = 0;
-    for (let t = -half; t <= half; t += stepT) {
+    for (let k = 0; k < nS; k++) {
+      const t = -half + k * stepT;
       const v = sampleBilinear(mag, w, h, mx + nx * off + vx * t, my + ny * off + vy * t);
       if (v === null) continue;
       sum += Math.min(v, 700); n++;
@@ -653,17 +769,19 @@ function snapLine(mag, w, h, a, b, range = 9) {
   let best = null;
   const dOff = range / 4;
   for (let ai = -3; ai <= 3; ai++) {
+    const ang = ai * 0.02, c = Math.cos(ang), s = Math.sin(ang);
     for (let oi = -4; oi <= 4; oi++) {
-      const ang = ai * 0.02, off = oi * dOff;
-      const sc = scoreAt(ang, off);
+      const off = oi * dOff;
+      const sc = scoreAt(c, s, off);
       if (!best || sc > best.sc) best = { sc, ang, off };
     }
   }
   const fineO = range / 16;
   for (let ai = -2; ai <= 2; ai++) {
+    const ang = best.ang + ai * 0.008, c = Math.cos(ang), s = Math.sin(ang);
     for (let oi = -2; oi <= 2; oi++) {
-      const ang = best.ang + ai * 0.008, off = best.off + oi * fineO;
-      const sc = scoreAt(ang, off);
+      const off = best.off + oi * fineO;
+      const sc = scoreAt(c, s, off);
       if (sc > best.sc) best = { sc, ang, off };
     }
   }
@@ -700,7 +818,7 @@ export function snapQuad(mag, w, h, quad, range = 9) {
  * Stage 2 snaps each side onto its gradient ridge for sub-pixel corners.
  * Stage 3 does a short walk uphill on the colour score to polish.
  */
-export function refineQuad(prepared, w, h, quad, { inset = false, passes = 2, iters = 3 } = {}) {
+export function refineQuad(prepared, w, h, quad, { inset = false, passes = 2, iters = 3, polish = true } = {}) {
   const { mag } = prepared;
   let best = quad.map((p) => p.slice());
   let bestScore = scoreQuad(prepared, w, h, best);
@@ -733,7 +851,10 @@ export function refineQuad(prepared, w, h, quad, { inset = false, passes = 2, it
     }
   }
 
-  // small uphill walk on the colour score
+  // small uphill walk on the colour score (skipped while merely tracking: the
+  // snap already lands on the ridge, and this walk was most of the cost of a
+  // per-frame refine)
+  if (!polish) return best;
   for (let round = 0; round < 2; round++) {
     const step = round === 0 ? 1.5 : 0.75;
     let improved = true, guard = 0;
@@ -835,19 +956,55 @@ export function describeBoard(prepared, w, h, H) {
  */
 export function describeSquares(gray, w, h, H, patch = 0) {
   const out = new Float32Array(64 * 9);
-  const offs = [0.25, 0.5, 0.75];
+  const h0 = H[0], h1 = H[1], h2 = H[2];
+  const h3 = H[3], h4 = H[4], h5 = H[5];
+  const h6 = H[6], h7 = H[7], h8 = H[8];
   const steps = patch > 0 ? [-patch, 0, patch] : [0];
+  const ns = steps.length;
+  const xmax = w - 1, ymax = h - 1;
+
   for (let r = 0; r < 8; r++) {
     for (let f = 0; f < 8; f++) {
+      // The four corners of this square, then a bilinear map inside it. Over a
+      // single square the difference from the exact homography is well below a
+      // pixel, and this keeps every sample free of a projection and an
+      // allocation (which is what made this 20 ms before).
+      const d00 = h6 * f + h7 * r + h8;
+      const d10 = h6 * (f + 1) + h7 * r + h8;
+      const d01 = h6 * f + h7 * (r + 1) + h8;
+      const d11 = h6 * (f + 1) + h7 * (r + 1) + h8;
+      if (!d00 || !d10 || !d01 || !d11) continue;
+      const x00 = (h0 * f + h1 * r + h2) / d00, y00 = (h3 * f + h4 * r + h5) / d00;
+      const x10 = (h0 * (f + 1) + h1 * r + h2) / d10, y10 = (h3 * (f + 1) + h4 * r + h5) / d10;
+      const x01 = (h0 * f + h1 * (r + 1) + h2) / d01, y01 = (h3 * f + h4 * (r + 1) + h5) / d01;
+      const x11 = (h0 * (f + 1) + h1 * (r + 1) + h2) / d11, y11 = (h3 * (f + 1) + h4 * (r + 1) + h5) / d11;
+      const ax = x10 - x00, ay = y10 - y00;
+      const bx = x01 - x00, by = y01 - y00;
+      const cx = x11 - x10 - x01 + x00, cy = y11 - y10 - y01 + y00;
+
       const base = (r * 8 + f) * 9;
       for (let i = 0; i < 3; i++) {
         for (let j = 0; j < 3; j++) {
           let sum = 0, n = 0;
-          for (const sy of steps) {
-            for (const sx of steps) {
-              const p = project(H, f + offs[j] + sx, r + offs[i] + sy);
-              const v = p ? sampleBilinear(gray, w, h, p[0], p[1]) : null;
-              if (v !== null) { sum += v; n++; }
+          for (let vi = 0; vi < ns; vi++) {
+            const v = 0.25 + 0.25 * i + steps[vi];
+            for (let ui = 0; ui < ns; ui++) {
+              const u = 0.25 + 0.25 * j + steps[ui];
+              const uv = u * v;
+              const px = x00 + ax * u + bx * v + cx * uv;
+              const py = y00 + ay * u + by * v + cy * uv;
+              if (!(px >= 0 && py >= 0 && px <= xmax && py <= ymax)) continue;
+              const x0 = px | 0, y0 = py | 0;
+              const fx = px - x0, fy = py - y0;
+              const x1 = x0 < xmax ? x0 + 1 : x0;
+              const y1 = y0 < ymax ? y0 + 1 : y0;
+              const r0 = y0 * w, r1 = y1 * w;
+              const a0 = gray[r0 + x0], b0 = gray[r0 + x1];
+              const c0 = gray[r1 + x0], d0 = gray[r1 + x1];
+              const top = a0 + (b0 - a0) * fx;
+              const bot = c0 + (d0 - c0) * fx;
+              sum += top + (bot - top) * fy;
+              n++;
             }
           }
           out[base + i * 3 + j] = n ? sum / n : 0;
@@ -909,7 +1066,12 @@ export class BoardTracker {
     this.tick = 0;
     this.misses = 0;
     this.badFrames = 0;
-    this.prevSmall = null;
+    this.prevThumb = null;
+    this.prevTw = 0;
+    this.prevTh = 0;
+    this.lastPrepared = null;
+    this.still = false;
+    this.motion = Infinity;
     this.redetected = false;
     this.frames = 0;
   }
@@ -921,7 +1083,8 @@ export class BoardTracker {
     this.misses = 0;
     this.badFrames = 0;
     this.tick = 0;
-    this.prevSmall = null;
+    this.prevThumb = null;
+    this.lastPrepared = null;
   }
 
   get locked() {
@@ -933,60 +1096,75 @@ export class BoardTracker {
    * @returns {{quad:number[][]|null, H:number[]|null, score:number, redetected:boolean}}
    */
   update(rgba, w, h) {
-    const prepared = prepare(grayFromRGBA(rgba, w, h), w, h);
     this.frames++;
     this.redetected = false;
     const quadBefore = this.quad;
 
-    // If the scene has not moved there is nothing to re-fit: freezing the quad
-    // is what keeps the sampling grid (and therefore the square descriptors)
-    // stable while the phone is held still.
-    const motion = frameMotion(prepared.gray4, this.prevSmall, prepared.sw4, prepared.sh4);
-    this.prevSmall = prepared.gray4;
-    const still = motion < 2;
+    // Cheap gate first: a quarter-scale thumbnail of the camera frame, diffed
+    // against the previous one. If the scene is static there is nothing to fit
+    // and nothing to sample, so the whole vision path is skipped and the
+    // previous descriptor is reused verbatim. This is the path a phone holding
+    // still on a board takes, and it costs a fraction of a millisecond.
+    const t = thumbFromRGBA(rgba, w, h, this.prevThumb, this.prevTw, this.prevTh);
+    this.prevThumb = t.thumb;
+    this.prevTw = t.tw;
+    this.prevTh = t.th;
+    const motion = t.motion;
 
-    if (!(this.quad && still)) {
-      // Re-detect only when something actually suggests the lock is stale:
-      // losing the score, a big jump, or a slow heartbeat. Re-detecting on a
-      // healthy lock just makes the grid jump around.
-      const due = !this.quad || this.score < 3
-        || this.tick++ % this.detectEvery === 0;
-      if (due) {
-        const det = detectQuad(prepared, w, h);
-        if (det) {
-          this.misses = 0;
-          this.redetected = true;
-          // If the detection lands on the board we already have, keep the
-          // existing lock: re-seating the grid by a pixel for no reason is what
-          // made every square look like it had changed.
-          const close = this.quad && meanCornerShift(this.quad, det.quad) < w * 0.02;
-          if (!close) this.quad = refineQuad(prepared, w, h, det.quad, { inset: true, passes: 3 });
-          const sc = scoreQuad(prepared, w, h, this.quad);
-          if (sc) this.score = sc.score;
-        } else if (this.quad) {
-          this.misses++;
-          if (this.misses > 4) this.reset();
-        }
+    if (this.quad && motion < 1.2) {
+      this.quadShift = 0;
+      this.motion = motion;
+      this.still = true;
+      return {
+        quad: this.quad, H: this.H, score: this.score, quadShift: 0,
+        redetected: false, motion, prepared: this.lastPrepared, still: true,
+      };
+    }
+    this.still = false;
+
+    const prepared = prepareFrame(rgba, w, h);
+    this.lastPrepared = prepared;
+
+    // Re-detect only when something actually suggests the lock is stale:
+    // losing the score, a big jump, or a slow heartbeat. Re-detecting on a
+    // healthy lock just makes the grid jump around.
+    const due = !this.quad || this.score < 3
+      || this.tick++ % this.detectEvery === 0;
+    if (due) {
+      const det = detectQuad(prepared, w, h);
+      if (det) {
+        this.misses = 0;
+        this.redetected = true;
+        // If the detection lands on the board we already have, keep the
+        // existing lock: re-seating the grid by a pixel for no reason is what
+        // made every square look like it had changed.
+        const close = this.quad && meanCornerShift(this.quad, det.quad) < w * 0.02;
+        if (!close) this.quad = refineQuad(prepared, w, h, det.quad, { inset: true, passes: 3 });
+        const sc = scoreQuad(prepared, w, h, this.quad);
+        if (sc) this.score = sc.score;
+      } else if (this.quad) {
+        this.misses++;
+        if (this.misses > 4) this.reset();
       }
+    }
 
-      if (this.quad && this.score < 4) {
-        // Only re-fit when the lock is starting to slip. A well-locked, static
-        // board must not be re-fitted at all: the snap can hop a few pixels onto
-        // a decorative border, and that silently poisons every square diff.
-        const refined = refineQuad(prepared, w, h, this.quad, { passes: 1 });
-        if (refined && validQuad(refined, w, h)) {
-          const sc = scoreQuad(prepared, w, h, refined);
-          if (sc && sc.score > 2.2) {
-            // only follow the ridge when it actually moved: re-fitting a static
-            // board on every frame is what makes the sampling grid wobble
-            if (meanCornerShift(this.quad, refined) > 0.6) this.quad = refined;
-            this.score = sc.score;
-            this.badFrames = 0;
-          } else if (++this.badFrames > 3) {
-            // the board is gone or the camera swung away: drop the lock so the
-            // next frame does a fresh search
-            this.reset();
-          }
+    if (this.quad && this.score < 4) {
+      // Only re-fit when the lock is starting to slip. A well-locked, static
+      // board must not be re-fitted at all: the snap can hop a few pixels onto
+      // a decorative border, and that silently poisons every square diff.
+      const refined = refineQuad(prepared, w, h, this.quad, { passes: 1, polish: false });
+      if (refined && validQuad(refined, w, h)) {
+        const sc = scoreQuad(prepared, w, h, refined);
+        if (sc && sc.score > 2.2) {
+          // only follow the ridge when it actually moved: re-fitting a static
+          // board on every frame is what makes the sampling grid wobble
+          if (meanCornerShift(this.quad, refined) > 0.6) this.quad = refined;
+          this.score = sc.score;
+          this.badFrames = 0;
+        } else if (++this.badFrames > 3) {
+          // the board is gone or the camera swung away: drop the lock so the
+          // next frame does a fresh search
+          this.reset();
         }
       }
     }
@@ -995,35 +1173,12 @@ export class BoardTracker {
     // how far the sampling grid moved this frame: callers must not compare
     // square descriptors across a grid change
     this.quadShift = quadBefore && this.quad ? meanCornerShift(quadBefore, this.quad) : 0;
+    this.motion = motion;
     return {
       quad: this.quad, H: this.H, score: this.score, quadShift: this.quadShift,
-      redetected: this.redetected, motion, prepared,
+      redetected: this.redetected, motion, prepared, still: false,
     };
   }
-}
-
-/**
- * Largest mean absolute difference over 8x8 blocks of the 1/4-scale image.
- *
- * A moving piece lights up one or two blocks strongly; sensor noise averages
- * out inside a block. This is the cheap "did anything change" test.
- */
-function frameMotion(a, b, sw, sh) {
-  if (!b || !a) return Infinity;
-  let worst = 0;
-  for (let by = 0; by < sh; by += 8) {
-    const y1 = Math.min(by + 8, sh);
-    for (let bx = 0; bx < sw; bx += 8) {
-      const x1 = Math.min(bx + 8, sw);
-      let s = 0, n = 0;
-      for (let y = by; y < y1; y++) {
-        const row = y * sw;
-        for (let x = bx; x < x1; x++) { s += Math.abs(a[row + x] - b[row + x]); n++; }
-      }
-      if (n && s / n > worst) worst = s / n;
-    }
-  }
-  return worst;
 }
 
 function meanCornerShift(a, b) {

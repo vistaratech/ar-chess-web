@@ -94,6 +94,42 @@ tests/               synthetic scenes and diagnostic pages
    score drops, or on a slow heartbeat, and a detection that lands on the board
    already held is ignored rather than applied.
 
+## Performance
+
+The loop is built so that a frame costs work only in proportion to how much
+actually changed. Measured at 640×360 in a desktop Chrome, per frame:
+
+| what | before | after |
+| --- | --- | --- |
+| frame where nothing moved | 28 ms | **0.2 ms** |
+| frame with a piece/camera change | 28 ms | **1.6 ms** |
+| first lock (search + refine) | ~40 ms | **12 ms** |
+| 14-pose detection suite, mean | 71 ms | **38 ms** |
+
+(28 ms was `prepare` + the 64-square descriptor, which the old loop computed on
+every processed frame; 0.2 ms is a still frame that only diffs a thumbnail.)
+
+What made the difference:
+
+- **A still frame skips the vision work entirely.** A quarter-scale thumbnail is
+  taken straight from the camera pixels and diffed against the previous frame,
+  averaged over 16×16-pixel blocks so sensor noise cancels. If nothing moved, the
+  previous square descriptor is reused verbatim — no gradient, no sampling, no
+  detection. A piece move or a one-pixel camera nudge is still 15–35 on the same
+  scale, so the gate is safe.
+- **Gradients are built lazily.** The Sobel maps are only needed for detection
+  and ridge snapping, so a frame that is merely tracked pays nothing for them.
+- **Buffers rotate instead of allocating.** Two scratch sets per resolution are
+  reused, so a running camera generates no garbage and the collector never has a
+  reason to interrupt the loop.
+- **Square sampling is affine per square.** Four corner projections plus a
+  bilinear map inside each cell replaced a per-sample homography transform and
+  array allocation — that alone was 22 ms of the 30 ms frame.
+- **The overlay uses a dark under-stroke instead of `shadowBlur`.** A canvas blur
+  pass per frame is several times the cost of one extra stroke.
+- **Frames are consumed as the camera produces them** (`requestVideoFrameCallback`)
+  rather than on every animation frame, so no frame is drawn or sampled twice.
+
 ## Tests
 
 All of it runs in the browser against synthetic scenes rendered with Canvas2D —
@@ -105,8 +141,12 @@ no phone required.
   - stability on a static frame,
   - reading 20 consecutive moves of a real opening.
 
-  Current result: **detection 14/14**, **move reading 20/20**, ~70 ms per
-  detection at 640×360.
+  Current result: **detection 14/14**, **move reading 20/20**, ~38 ms per
+  detection at 640×360 (and the same at 720×405 and 405×720).
+
+- `tests/perf.html` — per-stage timing at any resolution, plus the motion-gate
+  calibration table (identical frame / re-seeded noise / 1 px / 2 px / 6 px shift
+  / a moved pawn).
 
 - `tests/debug7.html` — per-pose candidate table (raw/snap error, score, gap) and
   a Hough line dump.

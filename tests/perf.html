@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>perf</title>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}pre{white-space:pre}</style>
+</head><body>
+<pre id="out">measuring…</pre>
+<script type="module">
+const bust = '?v=' + Date.now();
+const v = await import('../js/vision.js' + bust);
+const scene = await import('./scene.js' + bust);
+const { prepare, prepareFrame, grayFromRGBA, describeBoard, detectQuad, refineQuad, scoreQuad, BoardTracker, thumbFromRGBA } = v;
+const { renderScene, makePose } = scene;
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 640), H = +(qp.get('h') || 360);
+const cv = document.createElement('canvas');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const lines = [];
+const log = (s) => { lines.push(s); out.textContent = lines.join('\n'); };
+
+const quad = makePose(W, H, { tilt: 0.28, size: Math.min(W, H) * 0.84 });
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 6, seed: 5 });
+const rgba = ctx.getImageData(0, 0, W, H).data;
+
+function bench(label, n, fn) {
+  for (let i = 0; i < 3; i++) fn();
+  const t0 = performance.now();
+  for (let i = 0; i < n; i++) fn();
+  const ms = (performance.now() - t0) / n;
+  log(`${label.padEnd(30)} ${ms.toFixed(2)} ms`);
+  return ms;
+}
+
+const gray = grayFromRGBA(rgba, W, H);
+let prep = prepare(gray, W, H);
+const Hm = new BoardTracker({ side: 'w' }).update(rgba, W, H).H;
+bench('grayFromRGBA', 40, () => grayFromRGBA(rgba, W, H));
+bench('prepare(gray) full', 30, () => prepare(gray, W, H));
+bench('prepareFrame(rgba)', 30, () => prepareFrame(rgba, W, H));
+bench('prepareFrame + mag', 20, () => { const p = prepareFrame(rgba, W, H); return p.mag.length; });
+bench('describeBoard', 60, () => describeBoard(prep, W, H, Hm));
+bench('scoreQuad', 200, () => scoreQuad(prep, W, H, quad));
+bench('refineQuad passes=1', 40, () => refineQuad(prep, W, H, quad, { passes: 1, polish: false }));
+bench('detectQuad (cold)', 10, () => detectQuad(prep, W, H));
+
+const tracker = new BoardTracker({ side: 'w' });
+bench('tracker 1st frame (search)', 1, () => {
+  const t = new BoardTracker({ side: 'w' });
+  return t.update(rgba, W, H);
+});
+bench('tracker still frame', 60, () => tracker.update(rgba, W, H));
+log(`  locked=${tracker.locked} score=${tracker.score.toFixed(1)} still=${tracker.still}`);
+
+// a moving frame: shift the scene by a couple of pixels each call
+let k = 0;
+bench('tracker moving frame', 30, () => {
+  k++;
+  renderScene(ctx, { w: W, h: H, fen: START, quad: quad.map(([x, y]) => [x + (k % 3), y]), border: 0.02, light: 0.05, noise: 6, seed: 5 + (k % 7) });
+  return tracker.update(ctx.getImageData(0, 0, W, H).data, W, H);
+});
+
+// end-to-end cost of a still frame exactly as the app runs it
+bench('app still frame', 40, () => {
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const res = tracker.update(d, W, H);
+  return res.still ? res : null;
+});
+
+/* ---- motion gate calibration ------------------------------------- */
+log('\n--- motion gate (thumbnail block diff, threshold 1.2) ---');
+function motionFor({ fenA = START, fenB = START, dxA = 0, dxB = 0, seedA, seedB, noise = 8 }) {
+  const shift = (q, dx) => q.map(([x, y]) => [x + dx, y]);
+  renderScene(ctx, { w: W, h: H, fen: fenA, quad: shift(quad, dxA), border: 0.02, light: 0.05, noise, seed: seedA });
+  const a = ctx.getImageData(0, 0, W, H).data;
+  renderScene(ctx, { w: W, h: H, fen: fenB, quad: shift(quad, dxB), border: 0.02, light: 0.05, noise, seed: seedB });
+  const b = ctx.getImageData(0, 0, W, H).data;
+  const ta = thumbFromRGBA(a, W, H, null);
+  const tb = thumbFromRGBA(b, W, H, ta.thumb, ta.tw, ta.th);
+  return tb.motion;
+}
+for (const noise of [4, 8, 14]) {
+  const same = motionFor({ seedA: 3, seedB: 3, noise });
+  const noisier = motionFor({ seedA: 3, seedB: 4, noise });
+  const px1 = motionFor({ seedA: 3, seedB: 3, dxB: 1, noise });
+  const px2 = motionFor({ seedA: 3, seedB: 3, dxB: 2, noise });
+  const px6 = motionFor({ seedA: 3, seedB: 3, dxB: 6, noise });
+  const piece = motionFor({
+    fenA: START, fenB: 'rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1',
+    seedA: 3, seedB: 3, noise,
+  });
+  log(`noise ${String(noise).padStart(2)}: same=${same.toFixed(2)} reseed=${noisier.toFixed(2)} 1px=${px1.toFixed(2)} 2px=${px2.toFixed(2)} 6px=${px6.toFixed(2)} pawn-move=${piece.toFixed(2)}`);
+}
+
+/* ---- vision-only cost on moving frames ---------------------------- */
+{
+  const fens = ['rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1',
+    'rnbqkbnr/pppp1ppp/8/4p3/8/4P3/PPPP1PPP/RNBQKBNR w KQkq - 0 2',
+    'rnbqkbnr/pppp1ppp/8/4p3/8/4P3/PPPP1PPP/RNBQKBNR w KQkq - 0 3'];
+  const frames2 = [];
+  for (let i = 0; i < 6; i++) {
+    renderScene(ctx, { w: W, h: H, fen: fens[i % 3], quad, border: 0.02, light: 0.05, noise: 6, seed: 11 + i });
+    frames2.push(ctx.getImageData(0, 0, W, H).data);
+  }
+  const tr = new BoardTracker({ side: 'w' });
+  bench('vision: six moving frames', 8, () => {
+    for (const f of frames2) tr.update(f, W, H);
+  });
+  bench('vision: one moving frame', 24, () => tr.update(frames2[Math.floor(Math.random() * 6)], W, H));
+}
+
+log(`\nresolution ${W}x${H}`);
+window.__done = true;
+</script></body></html>

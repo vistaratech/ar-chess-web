@@ -34,8 +34,11 @@ let game = new Chess();
 let suggestion = null;         // { from, to, san, score, depth }
 let worker = null;
 let thinking = false;
-let lastRun = 0;
+let lastDesc = null;           // descriptor of the last sampled frame
 let frames = 0;
+let stepMs = 0;                // duration of the last processed frame
+let stepAvg = 0;               // smoothed duration, for the on-device readout
+let stillFrame = false;
 let status = { text: 'Starting camera…', tone: '' };
 
 /* ------------------------------------------------------------------ */
@@ -91,7 +94,7 @@ async function start() {
     await startDemo();
     startWorker();
     askEngine();
-    requestAnimationFrame(loop);
+    requestAnimationFrame(rafLoop);
     return;
   }
 
@@ -123,7 +126,7 @@ async function start() {
 
   startWorker();
   askEngine();
-  requestAnimationFrame(loop);
+  startLoop();
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,19 +172,22 @@ function renderDemo(now) {
 /* main loop                                                           */
 /* ------------------------------------------------------------------ */
 
-function loop(now) {
-  requestAnimationFrame(loop);
+/**
+ * One pass over the newest camera frame.
+ *
+ * The tracker decides how much work is needed: on a frame where nothing moved
+ * it returns the previous descriptor and we only redraw the overlay, so the
+ * loop stays at camera rate. Everything expensive (board search, ridge snap,
+ * square sampling) happens only on frames that actually changed.
+ */
+function step(now) {
+  const t0 = performance.now();
   if (DEMO) renderDemo(now);
   else {
     if (video.readyState < 2) return;
     ctx.drawImage(video, 0, 0, vw, vh);
   }
 
-  // Every frame while searching, every other frame once locked: the search is
-  // the expensive part, tracking a locked board is cheap.
-  const interval = tracker.locked ? 55 : 0;
-  if (now - lastRun < interval) { drawOverlay(); return; }
-  lastRun = now;
   frames++;
 
   let res;
@@ -193,13 +199,47 @@ function loop(now) {
   }
 
   if (res.H) {
-    const desc = describeBoard(res.prepared, vw, vh, res.H);
+    // On a still frame the sampling grid and the pixels are both unchanged, so
+    // the descriptor is exactly the previous one: reuse it instead of sampling
+    // 64 squares again.
+    let desc;
+    if (res.still && lastDesc && res.quadShift <= 0.25) {
+      desc = lastDesc;
+    } else {
+      desc = describeBoard(res.prepared, vw, vh, res.H);
+      lastDesc = desc;
+    }
     const r = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
     if (r.settled) readBoard(desc, r);
+  } else {
+    lastDesc = null;
   }
 
   updateStatus(res);
   drawOverlay();
+
+  const dt = performance.now() - t0;
+  stepMs = dt;
+  stepAvg = stepAvg ? stepAvg * 0.9 + dt * 0.1 : dt;
+  stillFrame = res.still;
+}
+
+/** Schedule `step` on every new camera frame (or the next animation frame). */
+function rafLoop(now) {
+  step(now);
+  requestAnimationFrame(rafLoop);
+}
+
+function startLoop() {
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    const onVideo = () => {
+      step(performance.now());
+      video.requestVideoFrameCallback(onVideo);
+    };
+    video.requestVideoFrameCallback(onVideo);
+    return;
+  }
+  requestAnimationFrame(rafLoop);
 }
 
 function readBoard(desc, r) {
@@ -258,19 +298,21 @@ function drawOverlay() {
   ctx.save();
   ctx.lineJoin = 'round';
 
-  // board outline
+  // board outline: dark under-stroke instead of a canvas shadow (a real blur
+  // pass per frame is far more expensive than one extra stroke)
+  const lw = Math.max(2, vw * 0.004);
   ctx.beginPath();
   for (let i = 0; i < 4; i++) {
     const [x, y] = q[i];
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.closePath();
-  ctx.strokeStyle = 'rgba(64, 214, 182, .95)';
-  ctx.lineWidth = Math.max(2, vw * 0.004);
-  ctx.shadowColor = 'rgba(0,0,0,.55)';
-  ctx.shadowBlur = 6;
+  ctx.lineWidth = lw * 2.4;
+  ctx.strokeStyle = 'rgba(0, 0, 0, .45)';
   ctx.stroke();
-  ctx.shadowBlur = 0;
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = 'rgba(64, 214, 182, .95)';
+  ctx.stroke();
 
   // corner ticks
   const r = Math.max(3, vw * 0.008);
@@ -314,11 +356,18 @@ function drawMove(H, mv) {
   ctx.save();
   ctx.strokeStyle = 'rgba(127, 240, 170, .95)';
   ctx.fillStyle = 'rgba(127, 240, 170, .95)';
-  ctx.shadowColor = 'rgba(0,0,0,.6)';
-  ctx.shadowBlur = 5;
-
-  ctx.lineWidth = width;
   ctx.lineCap = 'round';
+
+  // dark pass first so the arrow reads on a light board without a shadow blur
+  ctx.strokeStyle = 'rgba(0, 0, 0, .35)';
+  ctx.lineWidth = width * 1.7;
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(bx - ux * head * 0.55, by - uy * head * 0.55);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(127, 240, 170, .95)';
+  ctx.lineWidth = width;
   ctx.beginPath();
   ctx.moveTo(ax, ay);
   ctx.lineTo(bx - ux * head * 0.55, by - uy * head * 0.55);
@@ -355,6 +404,7 @@ function drawMove(H, mv) {
 sideSel.addEventListener('change', () => {
   tracker = new BoardTracker({ side: sideSel.value });
   reader = new MoveReader();
+  lastDesc = null;
   suggestion = null;
   setStatus('Switched side — hold the board in view', '');
   askEngine();
@@ -363,6 +413,7 @@ sideSel.addEventListener('change', () => {
 document.getElementById('resync').addEventListener('click', () => {
   game = new Chess();
   reader = new MoveReader();
+  lastDesc = null;
   suggestion = null;
   setStatus('Reset to the start position', 'ok');
   askEngine();
@@ -372,6 +423,7 @@ document.getElementById('undo').addEventListener('click', () => {
   if (game.undo()) {
     suggestion = null;
     reader = new MoveReader();
+    lastDesc = null;
     setStatus(`Took back to move ${game.history().length}`, '');
     askEngine();
   }
@@ -396,6 +448,10 @@ window.__ar = () => ({
   score: Number(tracker.score.toFixed(2)),
   quadShift: Number((tracker.quadShift || 0).toFixed(2)),
   frames,
+  ms: Number(stepMs.toFixed(2)),
+  avgMs: Number(stepAvg.toFixed(2)),
+  still: stillFrame,
+  motion: Number((tracker.motion ?? 0).toFixed(2)),
   status: status.text,
   turn: game.turn(),
   history: game.history(),
