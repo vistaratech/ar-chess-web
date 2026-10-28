@@ -1,8 +1,8 @@
 # AR Chess
 
 Point a phone at a real chessboard. The board is found and tracked automatically —
-no calibration taps — and the engine's best next move is drawn on the board as an
-arrow.
+no calibration taps — the opponent's move is read off the board, and the engine's
+best reply is drawn on the board as an arrow. Play the arrow and it disappears.
 
 Live: <https://ar-chess-web.vercel.app>
 
@@ -23,19 +23,33 @@ Live: <https://ar-chess-web.vercel.app>
   colour dropped. An arm lying across the board ruins the first and barely dents
   the second, so tracking stays glued while somebody moves pieces, and a move
   played *under* a resting hand is read as soon as the hand lifts.
-- **Move reading.** After the board has been still for two frames, the squares
-  that changed appearance are matched against the legal moves of the current
-  position, and the move is played in the app's own game state. The squares are
-  sampled on a grid that is *kept* between frames and only moved when the board
-  itself moves, so a sub-pixel re-fit cannot fake a change on a dozen squares.
-- **AR suggestion.** The engine (alpha-beta, quiescence, iterative deepening, in a
-  Web Worker) returns the best move for the side to move; it is drawn as an arrow
-  with the destination square ringed and the evaluation in the status bar.
+- **Reads the opponent's move.** After the board has been still for two frames,
+  the squares that changed appearance are matched against the legal moves of the
+  current position, and the move is played in the app's own game state. The
+  squares are sampled on a grid that is *kept* between frames and only moved when
+  the board itself moves, so a sub-pixel re-fit cannot fake a change on a dozen
+  squares. Whichever side moved is detected; no "it is my turn" button.
+- **Recommends your reply.** Once it is your turn, the engine (alpha-beta,
+  quiescence, iterative deepening, in a Web Worker) returns the best move; it is
+  drawn as an arrow with the piece's square and the destination both ringed, and
+  the evaluation in the HUD. The arrow is yours only: while the opponent is to
+  move there is no arrow,
+  and the engine does not waste its budget on a move the opponent's reply would
+  replace.
+- **Verifies the move was actually played.** When the board changes, the read is
+  compared with the recommendation. The arrow is dropped in the same frame the
+  move is read — before the next frame is drawn — and the app then waits for the
+  opponent's move. A change the app cannot read as a legal move also drops the
+  arrow (and asks for a resync): guidance is never left pointing at a position
+  that no longer exists. If a hand is over the board the arrow is held while the
+  move is hidden, and cleared the moment the move underneath it is confirmed.
 - **Your side.** With "I play Black" selected the app expects the board to be seen
   from Black's side of the table and names the squares accordingly.
 
-Demo without a camera: **`?demo=1`** renders a synthetic board that plays a short
-opening, so the whole pipeline can be watched on a desktop.
+Demo without a camera: **`?demo=1`** renders a synthetic board that plays both
+sides. The opponent's replies are scripted; your side plays exactly the move the
+arrow shows, so the whole read → recommend → verify → clear loop can be watched on
+a desktop.
 
 ## Honest limits
 
@@ -71,6 +85,19 @@ opening, so the whole pipeline can be watched on a desktop.
   and reads the move underneath it when the board is clear. (If a large change
   stays put for a few seconds it is taken as a new position and the app asks for a
   resync instead, so it cannot wait forever.)
+- **A move the app cannot read drops the arrow instead of keeping it.** If the
+  board changes in a way no legal move explains — a piece knocked over, a move
+  played out of turn, a mistake earlier in the game — the recommendation is
+  discarded and the app says "Could not read that move — tap Resync". It does not
+  re-suggest the same move for a board it can no longer account for. If the
+  recommendation is still legal and all of its squares are among those that
+  changed, a single unrelated square also moving does not stop it being accepted
+  as played.
+- The app cannot tell *which* piece moved, only which squares changed, so it
+  cannot check that the right piece landed on the destination — only that a legal
+  move produces exactly this change set, and that it is the recommended one. A
+  board whose position has already drifted from the app's game cannot be repaired
+  by reading; use **Resync**.
 - The engine searches for a fixed time budget (~1.8 s), which is roughly depth 3–4
   with this move generator. It plays sensibly and finds mates, but it is not a
   strong engine.
@@ -89,9 +116,10 @@ python -m http.server 8765
 
 ```
 index.html          UI shell: camera view, status bar, controls
-js/app.js           camera loop, tracking, move reading, AR overlay
+js/app.js           camera loop, tracking, AR overlay
 js/vision.js        board detection & tracking, square sampling
 js/track.js         change set -> chess move
+js/coach.js         read -> recommend -> verify loop, game state, no DOM
 js/engine.js        search engine (module worker)
 vendor/chess.js     chess.js 0.13.4 (ES module build, vendored)
 tests/               synthetic scenes and diagnostic pages
@@ -215,13 +243,20 @@ no phone required.
     forearm lying across the board, a move played under a hand, a move played out
     of a hand, and four scenes with no board at all (which must *not* lock),
   - the same board in every corner of the frame at three sizes and two rotations,
-    which must be found *and* named the right way round.
+    which must be found *and* named the right way round,
+  - the recommendation loop: a move is suggested, played on the board and must be
+    read back as *the suggested move*, with the arrow gone in the same read; a
+    whole sequence of opponent/reply pairs; playing a different move; a hand over
+    the board while the move is made underneath it; a board change that no legal
+    move explains; the same loop with the player on Black; and the reported bug
+    itself — a recommended king move, and castling (four changed squares).
 
   Current result, at 480×270 / 720×405 / 405×720: **detection 14/14** (mean 33–44 ms
   per detection, readback included), **orientation correct both sides**,
   **corner occluded 6/6**, **pan + arm 18/18 followed, 0 locks lost, worst corner
   error 0.3–0.4 % of board width**, **move reading 20/20**, **moves under/out of a
-  hand read correctly**, **false locks 0/4**, **board anywhere 29/30, 30/30, 30/30**.
+  hand read correctly**, **false locks 0/4**, **board anywhere 29/30, 30/30, 30/30**,
+  **recommendation loop 39/39**.
 
 - `tests/placement.html` — how much of the frame a board may occupy and where it
   may sit. Group A places the board fully inside the frame (by its real bounding
@@ -258,6 +293,10 @@ no phone required.
 
 ## A note on the economic part of "best move"
 
-The suggestion is computed for whichever side is to move and is only drawn when
-that side is the one selected in the UI, so the arrow is your move, not the
-opponent's.
+The suggestion is computed only for the side selected in the UI, and only while
+it is that side's turn. The engine runs in a worker for a fixed budget (~1.8 s);
+the camera loop keeps running meanwhile, and an answer that arrives after the
+position has changed (the user moved before the arrow appeared) is discarded by
+request id rather than drawn. When the opponent moves, the app spends the next
+thinking period on your reply. When you move, it does not think at all — it
+verifies the move against the arrow and goes back to watching the board.

@@ -4,11 +4,17 @@
  * The camera frame is drawn into the same canvas the overlay is drawn on, which
  * keeps the outline and the arrows in exact registration no matter how the
  * canvas is scaled by CSS.
+ *
+ * The game logic — what a change on the board means, whose move it is, and
+ * whether the move that was recommended has actually been played — lives in
+ * coach.js, so it can be tested without a camera. This file is the skin: camera,
+ * tracker, reader, worker, overlay and status line.
  */
 
 import { Chess } from '../vendor/chess.js';
 import { BoardTracker, BoardSampler, project } from './vision.js';
-import { MoveReader, inferMove } from './track.js';
+import { MoveReader } from './track.js';
+import { Coach } from './coach.js';
 
 const MAX_EDGE = 720;          // detection resolution, long edge
 const MS = 1800;               // engine time budget
@@ -30,10 +36,9 @@ video.autoplay = true;
 let vw = 640, vh = 480;
 let tracker = new BoardTracker({ side: sideSel.value });
 let reader = new MoveReader();
-let game = new Chess();
-let suggestion = null;         // { from, to, san, score, depth }
+const game = new Chess();
+const coach = new Coach(game, { side: sideSel.value });
 let worker = null;
-let thinking = false;
 let lastDesc = null;           // descriptor of the last sampled frame
 const sampler = new BoardSampler();   // the grid descriptors are sampled on
 let frames = 0;
@@ -41,6 +46,8 @@ let stepMs = 0;                // duration of the last processed frame
 let stepAvg = 0;               // smoothed duration, for the on-device readout
 let stillFrame = false;
 let occluded = false;          // a hand/arm is over the board right now
+let desynced = false;          // a board change could not be read as a move
+let holdStatus = 0;
 let status = { text: 'Starting camera…', tone: '' };
 
 /* ------------------------------------------------------------------ */
@@ -52,37 +59,64 @@ function startWorker() {
     worker = new Worker('./js/engine.js', { type: 'module' });
     worker.onmessage = (e) => {
       const m = e.data;
-      if (m.type === 'info') return;
-      if (m.type === 'best') {
-        thinking = false;
-        if (!m.from || m.fen !== game.fen()) return;
-        suggestion = { from: m.from, to: m.to, san: m.san, score: m.score, depth: m.depth };
-        bestEl.textContent = describeSuggestion();
-      }
+      if (m.type !== 'best') return;
+      const live = m.id === coach.req;
+      // the recommendation is the useful thing to read now: let it replace the
+      // transient "move read" message instead of waiting out its hold
+      if (coach.best(m.id, m)) holdStatus = 0;
+      if (live) showBest();
     };
-    worker.onerror = () => { worker = null; };
+    worker.onerror = () => {
+      worker = null;
+      coach.thinking = false;
+      showBest();
+    };
   } catch {
     worker = null;
   }
 }
 
-function describeSuggestion() {
-  if (!suggestion) return '';
-  const pawns = suggestion.score / 100;
+function describeSuggestion(s) {
+  const pawns = s.score / 100;
   const sign = pawns > 0 ? '+' : '';
-  return `${suggestion.san}   ${sign}${pawns.toFixed(1)}`;
+  return `${s.san}   ${sign}${pawns.toFixed(1)}`;
 }
 
+/**
+ * The `best` line in the HUD. Empty while it is the opponent's turn: showing
+ * their best move there reads as a recommendation to us, which it is not.
+ */
+function showBest() {
+  const g = coach.guidance;
+  if (g) bestEl.textContent = describeSuggestion(g);
+  else if (coach.thinking) bestEl.textContent = 'thinking…';
+  else if (game.game_over()) bestEl.textContent = game.in_checkmate() ? 'checkmate' : 'draw';
+  else bestEl.textContent = '';
+}
+
+/**
+ * Ask the coach for the next move and forward the request to the worker.
+ *
+ * The coach only asks when it is our turn: computing a move for the opponent
+ * would only be overwritten by the position their move produces, and drawing it
+ * would be wrong.
+ */
 function askEngine() {
-  if (!worker) { bestEl.textContent = 'engine unavailable'; return; }
-  if (game.game_over()) {
-    suggestion = null;
-    bestEl.textContent = game.in_checkmate() ? 'checkmate' : 'draw';
+  const req = coach.request();
+  showBest();
+  if (!req) return;
+  if (!worker) {
+    coach.thinking = false;
+    bestEl.textContent = 'engine unavailable';
     return;
   }
-  thinking = true;
-  bestEl.textContent = 'thinking…';
-  worker.postMessage({ type: 'think', fen: game.fen(), ms: MS });
+  try {
+    worker.postMessage({ type: 'think', id: req.id, fen: req.fen, ms: MS });
+  } catch {
+    worker = null;
+    coach.thinking = false;
+    bestEl.textContent = 'engine unavailable';
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -138,36 +172,96 @@ async function start() {
 let demo = null;
 
 async function startDemo() {
-  const [{ Chess }, scene] = await Promise.all([
-    import('../vendor/chess.js'),
-    import('../tests/scene.js'),
-  ]);
+  const scene = await import('../tests/scene.js');
   demo = {
-    Chess,
     scene,
     game: new Chess(),
     quad: scene.makePose(640, 360, { tilt: 0.28, size: Math.min(640, 360) * 0.86 }),
-    script: ['e4', 'c5', 'Nf3', 'd6', 'd4', 'cxd4', 'Nxd4', 'Nf6'],
-    index: 0,
-    next: performance.now() + 2200,
+    replies: ['c5', 'd6', 'Nf6', 'e6', 'Be7', 'a6', 'b5', 'O-O'],
+    reply: 0,
+    plays: 0,
+    next: performance.now() + 1400,
+    armed: 0,
   };
-  document.getElementById('hint').classList.add('show');
-  document.getElementById('hintExtra').textContent = 'Demo mode: a synthetic board is playing through the Spanish opening.';
+  hintEl.classList.add('show');
+  document.getElementById('hintExtra').textContent =
+    'Demo mode: a synthetic board plays both sides. Your move is the one the arrow shows.';
   // the synthetic scene draws the board from White's side of the table
   sideSel.value = 'w';
   tracker = new BoardTracker({ side: 'w' });
+  coach.setSide('w');
   reader = new MoveReader();
 }
 
-function renderDemo(now) {
-  if (demo.index < demo.script.length && now > demo.next) {
-    demo.game.move(demo.script[demo.index++]);
+/**
+ * Drive the synthetic board the way a person would.
+ *
+ * `demo.game` is the *physical* board; the coach's game is what the camera has
+ * read. Before every synthetic move the physical board is reloaded from the
+ * read position, so a missed read can never leave the demo permanently out of
+ * sync — it just retries from where the app actually is.
+ *
+ * Our move is always played exactly as the arrow says, which is what exercises
+ * "recommend, then clear the arrow as soon as it is played" end to end.
+ */
+function maybeStepDemo(now) {
+  if (!demo || now < demo.next) return;
+  const live = coach.game;
+  if (live.game_over() || demo.plays >= 60) return;
+
+  demo.game.load(live.fen());
+
+  if (coach.myTurn) {
+    const g = coach.guidance;
+    if (!g) { demo.next = now + 300; demo.armed = 0; return; }
+    if (!demo.armed) demo.armed = now + 1800;   // show the arrow for a moment
+    if (now < demo.armed) { demo.next = demo.armed; return; }
+    demo.armed = 0;
+    demo.game.move({ from: g.from, to: g.to, promotion: 'q' });
+    demo.plays++;
     demo.next = now + 2400;
+    return;
   }
+
+  const mv = demoReply(demo.game);
+  if (!mv) { demo.next = now + 1000; return; }
+  demo.game.move(mv);
+  demo.plays++;
+  demo.next = now + 2400;
+}
+
+function demoReply(g) {
+  const legal = g.moves({ verbose: true });
+  if (!legal.length) return null;
+  for (let i = 0; i < demo.replies.length; i++) {
+    const want = demo.replies[(demo.reply + i) % demo.replies.length];
+    const mv = legal.find((m) => m.san === want);
+    if (mv) {
+      demo.reply = (demo.reply + i + 1) % demo.replies.length;
+      return mv;
+    }
+  }
+  return legal[(demo.plays * 5) % legal.length];
+}
+
+function renderDemo(now) {
+  maybeStepDemo(now);
   demo.scene.renderScene(ctx, {
     w: vw, h: vh, fen: demo.game.fen(), quad: demo.quad,
-    border: 0.02, light: 0.05, noise: 4, seed: 7 + demo.index,
+    border: 0.02, light: 0.05, noise: 4, seed: 7 + demo.plays,
   });
+}
+
+/**
+ * Put the synthetic board back in step after Resync, Undo or a side change.
+ * Without this the demo would keep the old position for up to a move's hold,
+ * and the freshly reset reader would re-base on a board that is about to jump.
+ */
+function syncDemo() {
+  if (!demo) return;
+  demo.game.load(game.fen());
+  demo.armed = 0;
+  demo.next = 0;        // act on the very next frame
 }
 
 /* ------------------------------------------------------------------ */
@@ -256,30 +350,39 @@ function startLoop() {
 
 function readBoard(desc, r) {
   // Too much changed to be a move: a hand, an arm, or the board being handled.
-  // Keep the confirmed position as the reference and wait — the move being
-  // played underneath the hand is read as soon as the board is clear again.
-  // (Only after the change set has been stable for several seconds does the
-  // reader insist on a re-baseline, which is what `stuck` means.)
+  // Keep the confirmed position *and* the guidance as the reference and wait —
+  // the move being played underneath the hand is read as soon as the board is
+  // clear again. (Only after the change set has been stable for several seconds
+  // does the reader insist on a re-baseline, which is what `stuck` means.)
   if (r.implausible && !r.stuck) {
     setStatus('Hand over the board — waiting for a clear view', '');
     return;
   }
 
-  const inf = inferMove(game.moves({ verbose: true }), r.changed);
-  if (inf.accepted) {
-    game.move({ from: inf.move.from, to: inf.move.to, promotion: inf.move.promotion || 'q' });
-    reader.commit(desc);
-    suggestion = null;
-    setStatus(`Move read: ${inf.move.san}`, 'ok');
-    askEngine();
+  const out = coach.read(r.changed);
+  reader.commit(desc);
+
+  if (out.accepted) {
+    desynced = false;
+    const san = out.move.san;
+    if (out.played) {
+      // The arrow is already gone: coach.read() dropped it before returning.
+      setStatus(`Played ${san} — waiting for ${coach.opponentName}`, 'ok');
+    } else {
+      setStatus(`Move read: ${san}`, 'ok');
+    }
+    askEngine();   // thinks only when it is our turn
     return;
   }
-  // Nothing conclusive this time: take the frame as the new reference so the
-  // next move is measured from here instead of piling up differences.
-  reader.commit(desc);
+
+  // Nothing conclusive this time. The coach has dropped the recommendation, so
+  // the arrow cannot linger on a position that has moved on; do not ask again
+  // for the same position or it would simply come back.
+  desynced = true;
   setStatus(r.stuck
     ? 'Board changed a lot — tap Resync if that was not a hand'
     : 'Could not read that move — tap Resync', 'bad');
+  showBest();
 }
 
 function updateStatus(res) {
@@ -292,15 +395,28 @@ function updateStatus(res) {
     setStatus('Hand over the board — waiting for a clear view', '');
     return;
   }
-  if (!thinking && game.turn() === tracker.side) {
-    const label = game.turn() === 'w' ? 'White' : 'Black';
-    setStatus(`Board locked · suggested move for ${label}`, 'ok');
-  } else if (!thinking) {
-    setStatus('Board locked · watching for your move', 'ok');
+  if (desynced) {
+    setStatus('Could not read that move — tap Resync', 'bad');
+    return;
   }
+  if (game.game_over()) {
+    setStatus(game.in_checkmate() ? 'Checkmate' : 'Draw', '');
+    return;
+  }
+  if (coach.guidance) {
+    setStatus(`Board locked · play ${coach.guidance.san} (${coach.sideName})`, 'ok');
+    return;
+  }
+  if (coach.thinking) {
+    setStatus('Board locked · thinking…', 'ok');
+    return;
+  }
+  if (coach.myTurn) {
+    setStatus(`Board locked · ${coach.sideName} to move`, 'ok');
+    return;
+  }
+  setStatus(`Board locked · watching for ${coach.opponentName}'s move`, 'ok');
 }
-
-let holdStatus = 0;
 
 function setStatus(text, tone) {
   if (status.text === text) return;
@@ -309,7 +425,8 @@ function setStatus(text, tone) {
   dot.className = tone || '';
   // keep transient messages on screen for a moment instead of letting the
   // idle status overwrite them on the next frame
-  holdStatus = tone === 'bad' || text.startsWith('Move read') ? performance.now() + 2600 : 0;
+  const transient = tone === 'bad' || text.startsWith('Move read') || text.startsWith('Played ');
+  holdStatus = transient ? performance.now() + 2600 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,9 +465,11 @@ function drawOverlay() {
     ctx.fill();
   }
 
-  if (suggestion && tracker.H && game.turn() === tracker.side) {
-    drawMove(tracker.H, suggestion);
-  }
+  // `guidance` is null unless the recommendation belongs to the position on
+  // the board right now and it is our turn — the single source of truth for
+  // "should the arrow be visible".
+  const g = coach.guidance;
+  if (g && tracker.H) drawMove(tracker.H, g);
   ctx.restore();
 }
 
@@ -406,20 +525,27 @@ function drawMove(H, mv) {
   ctx.closePath();
   ctx.fill();
 
-  // ring on the destination square so a drop is unambiguous
-  const f = 'abcdefgh'.indexOf(mv.to[0]);
-  const rank = Number(mv.to[1]) - 1;
-  const c0 = project(H, f + 0.12, rank + 0.12);
-  const c1 = project(H, f + 0.88, rank + 0.88);
-  if (c0 && c1) {
-    ctx.lineWidth = Math.max(2, width * 0.35);
-    ctx.strokeStyle = 'rgba(127, 240, 170, .55)';
-    ctx.beginPath();
-    ctx.ellipse((c0[0] + c1[0]) / 2, (c0[1] + c1[1]) / 2,
-      Math.abs(c1[0] - c0[0]) / 2 || 1, Math.abs(c1[1] - c0[1]) / 2 || 1, 0, 0, Math.PI * 2);
-    ctx.stroke();
-  }
+  // ring the square the piece starts on and the destination, so a long arrow
+  // reads unambiguously at both ends
+  ctx.lineWidth = Math.max(2, width * 0.35);
+  ctx.strokeStyle = 'rgba(127, 240, 170, .35)';
+  ringSquare(H, mv.from);
+  ctx.strokeStyle = 'rgba(127, 240, 170, .6)';
+  ringSquare(H, mv.to);
   ctx.restore();
+}
+
+/** Outline one square, following the perspective of the board. */
+function ringSquare(H, square) {
+  const f = 'abcdefgh'.indexOf(square[0]);
+  const r = Number(square[1]) - 1;
+  const pts = [[f + 0.13, r + 0.13], [f + 0.87, r + 0.13], [f + 0.87, r + 0.87], [f + 0.13, r + 0.87]]
+    .map(([x, y]) => project(H, x, y));
+  if (pts.some((p) => !p)) return;
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath();
+  ctx.stroke();
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,30 +554,40 @@ function drawMove(H, mv) {
 
 sideSel.addEventListener('change', () => {
   tracker = new BoardTracker({ side: sideSel.value });
+  coach.setSide(sideSel.value);
   reader = new MoveReader();
   lastDesc = null;
   sampler.reset();
-  suggestion = null;
+  desynced = false;
+  if (demo) {
+    // the demo scene must be seen from the side being played
+    demo.quad = demo.scene.makePose(vw, vh, {
+      tilt: 0.28, size: Math.min(vw, vh) * 0.86, flip: sideSel.value === 'b',
+    });
+  }
+  syncDemo();
   setStatus('Switched side — hold the board in view', '');
   askEngine();
 });
 
 document.getElementById('resync').addEventListener('click', () => {
-  game = new Chess();
+  coach.reset();
   reader = new MoveReader();
   lastDesc = null;
   sampler.reset();
-  suggestion = null;
+  desynced = false;
+  syncDemo();
   setStatus('Reset to the start position', 'ok');
   askEngine();
 });
 
 document.getElementById('undo').addEventListener('click', () => {
-  if (game.undo()) {
-    suggestion = null;
+  if (coach.undo()) {
     reader = new MoveReader();
     lastDesc = null;
     sampler.reset();
+    desynced = false;
+    syncDemo();
     setStatus(`Took back to move ${game.history().length}`, '');
     askEngine();
   }
@@ -483,7 +619,12 @@ window.__ar = () => ({
   occluded,
   motion: Number((tracker.motion ?? 0).toFixed(2)),
   status: status.text,
+  side: coach.side,
   turn: game.turn(),
+  myTurn: coach.myTurn,
+  thinking: coach.thinking,
+  desynced,
   history: game.history(),
-  suggestion: suggestion && suggestion.san,
+  suggestion: coach.guidance ? coach.guidance.san : null,
+  pending: coach.suggestion ? coach.suggestion.san : null,
 });

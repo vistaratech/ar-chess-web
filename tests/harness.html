@@ -21,6 +21,7 @@ import {
 } from '../js/vision.js';
 import { renderScene, makePose } from './scene.js';
 import { MoveReader, inferMove, indexSquare } from '../js/track.js';
+import { Coach } from '../js/coach.js';
 
 const qp = new URLSearchParams(location.search);
 const W = +(qp.get('w') || 480), H = +(qp.get('h') || 270);
@@ -426,9 +427,252 @@ log('\n=== 6. board anywhere ===');
   for (const f of fails6.slice(0, 5)) log(`   ${f}`);
 }
 
+/* ------------------------------------------------------------------ */
+/* 7. the recommendation loop                                          */
+/* ------------------------------------------------------------------ */
+log('\n=== 7. recommendation loop ===');
+{
+  let ok7 = 0, n7 = 0;
+  const check = (name, cond, extra = '') => {
+    n7++;
+    if (cond) ok7++;
+    log(`  ${name}: ${cond ? 'ok' : 'FAIL'}${extra ? ` (${extra})` : ''}`);
+  };
+
+  /**
+   * A fresh camera + physical board + app state, locked on the synthetic scene.
+   * `phys` is the board on the table; `coach.game` is what the camera has read.
+   */
+  function rig(side = 'w', flip = false, fen = null) {
+    const quad = makePose(W, H, { tilt: 0.26, size: Math.min(W, H) * 0.8, flip });
+    const r = {
+      side,
+      quad,
+      phys: new Chess(fen || undefined),
+      tracker: new BoardTracker({ side }),
+      sampler: new BoardSampler(),
+      reader: new MoveReader(),
+      coach: new Coach(new Chess(fen || undefined), { side }),
+      req: null,
+    };
+    r.shot = (occ = null) => renderScene(ctx, {
+      w: W, h: H, fen: r.phys.fen(), quad, border: 0.02, light: 0.04,
+      noise: 9, seed: 77, occluders: occ,
+    });
+    // the page's engine, replaced by a chosen answer so the test is repeatable
+    r.think = () => { r.req = r.coach.request(); return r.req; };
+    r.answer = (san) => {
+      if (!r.req) return null;
+      const g = new Chess();
+      g.load(r.req.fen);
+      const legal = g.moves({ verbose: true });
+      const mv = legal.find((m) => m.san === san) || legal[0];
+      if (!mv) { r.req = null; return null; }
+      const okBest = r.coach.best(r.req.id, {
+        fen: r.req.fen, from: mv.from, to: mv.to, san: mv.san, score: 12, depth: 3,
+      });
+      r.req = null;
+      return okBest ? mv : null;
+    };
+    // the app's per-frame path: track, sample, and read a settled change
+    r.pump = (n = 8, occ = null) => {
+      let out = { r: null, read: null };
+      for (let i = 0; i < n; i++) {
+        r.shot(occ);
+        const res = r.tracker.update(frame(), W, H);
+        if (!res.H) { out = { r: null, read: null }; continue; }
+        const { r: rr, desc } = sample(res, r.sampler, r.reader);
+        out = { r: rr, read: null };
+        if (rr.settled || rr.stuck) {
+          out.read = r.coach.read(rr.changed);
+          r.reader.commit(desc);
+          break;
+        }
+      }
+      return out;
+    };
+    r.shot();
+    const res = r.tracker.update(frame(), W, H);
+    r.locked = !!res.H;
+    if (r.locked) r.reader.commit(r.sampler.see(res.prepared, W, H, res));
+    return r;
+  }
+
+  const ownPlayed = (p) => !!(p.read && p.read.accepted && p.read.played);
+
+  // 7a. the reported bug: play the recommended move, the arrow must go
+  {
+    const r = rig('w');
+    check('locked', r.locked);
+    r.think();
+    check('asks the engine on our turn', !!r.req);
+    r.answer('e4');
+    const g = r.coach.guidance;
+    check('arrow for our move', !!g && g.san === 'e4', g && g.san);
+
+    r.phys.move('e4');
+    const p = r.pump(8);
+    check('our move read', !!(p.read && p.read.accepted),
+      p.read ? (p.read.accepted ? 'accepted' : 'unreadable') : 'no settle');
+    check('our move verified against the suggestion', ownPlayed(p));
+    check('arrow dropped in the same read',
+      r.coach.suggestion === null && r.coach.guidance === null);
+    check('turn passed to the opponent', !r.coach.myTurn);
+
+    r.pump(5);
+    check('no arrow comes back while the opponent is to move', r.coach.guidance === null);
+  }
+
+  // 7b. a whole sequence: opponent move -> suggestion -> our move -> next
+  {
+    const r = rig('w');
+    r.think();
+    const e4 = r.answer('e4');
+    r.phys.move({ from: e4.from, to: e4.to });
+    r.pump(8);
+
+    const line = [['c5', 'Nf3'], ['d6', 'd4'], ['cxd4', 'Nxd4'], ['Nf6', 'Nc3'], ['a6', 'Be2']];
+    let reads = 0, verified = 0, cleared = 1;
+    for (const [opp, own] of line) {
+      r.phys.move(opp);
+      const p = r.pump(8);
+      if (p.read && p.read.accepted && !p.read.played) reads++;
+      r.think();
+      const mv = r.answer(own);
+      const g = r.coach.guidance;
+      if (!mv || !g) continue;
+      r.phys.move({ from: g.from, to: g.to });
+      const q = r.pump(8);
+      if (ownPlayed(q)) verified++;
+      if (r.coach.suggestion === null) cleared++;
+    }
+    check('opponent moves read', reads === 5, `${reads}/5`);
+    check('our moves verified', verified === 5, `${verified}/5`);
+    check('arrow cleared after each of our moves', cleared === 6, `${cleared}/6`);
+    check('nothing left over after the last move',
+      r.coach.suggestion === null && !r.coach.myTurn);
+  }
+
+  // 7c. playing something other than the arrow also clears it
+  {
+    const r = rig('w');
+    r.think();
+    r.answer('d4');
+    const g = r.coach.guidance;
+    check('arrow for d4', !!g && g.san === 'd4', g && g.san);
+    const other = r.coach.game.moves({ verbose: true })
+      .find((m) => m.from !== g.from || m.to !== g.to);
+    r.phys.move(other);
+    const p = r.pump(8);
+    check('a different move is read', !!(p.read && p.read.accepted && !p.read.played));
+    check('a different move clears the arrow', r.coach.suggestion === null);
+    check('the game follows the physical board',
+      r.coach.game.history().slice(-1)[0] === other.san);
+  }
+
+  // 7d. a hand over the board: hold the arrow, then clear it once the move
+  //     played underneath the hand is confirmed
+  {
+    const r = rig('w');
+    r.think();
+    const mv = r.answer('e4');
+    check('arrow before the hand', !!r.coach.guidance);
+    // the same hand that parks on a corner in section 4c, well away from e2/e4
+    const HAND7 = { pts: [[-0.4, 5.6], [1.6, 6.2], [2.2, 7.4]], width: 2.4 };
+    r.pump(3, [HAND7]);
+    check('arrow survives a hand on the board', !!r.coach.guidance);
+    r.phys.move({ from: mv.from, to: mv.to });
+    r.pump(3, [HAND7]);
+    check('arrow held while the move is hidden', !!r.coach.guidance);
+    const p = r.pump(10);
+    check('move under the hand is verified when the view clears', ownPlayed(p));
+    check('arrow cleared once the move is confirmed', r.coach.suggestion === null);
+  }
+
+  // 7e. a change no legal move explains: clear the arrow and do not ask again
+  {
+    const r = rig('w');
+    r.think();
+    r.answer('Nf3');
+    check('arrow before the bad change', !!r.coach.guidance);
+    // Move a *black* pawn by hand while it is White's move: the board on the
+    // table no longer matches the game, which is what a misread leaves behind.
+    const g = new Chess();
+    g.load(r.phys.fen());
+    const pawn = g.get('b7');
+    g.remove('b7');
+    g.remove('b6');
+    g.put(pawn, 'b6');
+    r.phys = g;
+    const p = r.pump(8);
+    check('not treated as a legal move', !!(p.read && !p.read.accepted));
+    check('unreadable change clears the arrow',
+      r.coach.suggestion === null && r.coach.guidance === null);
+    check('no new request for the same broken position', r.req === null);
+    r.pump(8);
+    check('no arrow reappears on the following frames', r.coach.suggestion === null);
+  }
+
+  // 7f. the same loop with the player on Black: the board is seen from the
+  //     other side, so the whole grid is rotated in the frame
+  {
+    const r = rig('b', true);
+    check('locked from the other side', r.locked);
+    r.think();
+    check('no suggestion while the opponent is to move',
+      r.req === null && r.coach.guidance === null);
+
+    r.phys.move('e4');
+    const p = r.pump(8);
+    check('opponent move read from the other side',
+      !!(p.read && p.read.accepted && !p.read.played));
+    r.think();
+    r.answer('e5');
+    const g = r.coach.guidance;
+    check('arrow for Black', !!g && g.san === 'e5', g && g.san);
+    r.phys.move({ from: g.from, to: g.to });
+    const q = r.pump(8);
+    check('Black move verified', ownPlayed(q));
+    check('Black arrow cleared', r.coach.suggestion === null);
+  }
+
+  // 7g. the exact complaint: a king move is recommended, the king is moved,
+  //     and the arrow must go — including castling, which changes four squares
+  {
+    const r = rig('w', false, '4k3/8/8/8/8/8/4P3/4K3 w - - 0 1');
+    check('locked (king endgame)', r.locked);
+    r.think();
+    r.answer('Kf1');
+    const g = r.coach.guidance;
+    check('arrow for the king move', !!g && g.san === 'Kf1', g && g.san);
+    r.phys.move('Kf1');
+    const p = r.pump(8);
+    check('king move read as the suggestion', ownPlayed(p));
+    check('king arrow cleared', r.coach.suggestion === null);
+  }
+  {
+    const r = rig('w', false, 'r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1');
+    r.think();
+    const mv = r.answer('O-O');
+    check('arrow for castling', !!mv && r.coach.guidance && r.coach.guidance.san === 'O-O');
+    r.phys.move(mv);
+    const p = r.pump(8);
+    check('castling read as the suggestion', ownPlayed(p));
+    check('castling arrow cleared', r.coach.suggestion === null);
+  }
+
+  log(`  recommendation loop: ${ok7}/${n7}`);
+  window.__rec = { ok: ok7, total: n7 };
+}
+
 log('\ndone');
 window.__done = true;
-window.__summary = { detection: `${ok}/${total}`, moveRead: `${pass}/${moves.length}`, falseLocks };
+window.__summary = {
+  detection: `${ok}/${total}`,
+  moveRead: `${pass}/${moves.length}`,
+  falseLocks,
+  rec: window.__rec ? `${window.__rec.ok}/${window.__rec.total}` : '-',
+};
 </script>
 </body>
 </html>

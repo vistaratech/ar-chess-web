@@ -7,9 +7,12 @@
  * a second on a phone while the camera loop is running in the page.
  *
  * Protocol
- *   in : { type: 'think', fen, ms }      ms = time budget, default 1200
- *   out: { type: 'best', fen, from, to, promotion, san, score, depth, nodes, pv }
+ *   in : { type: 'think', id, fen, ms }  ms = time budget, default 1200
+ *   out: { type: 'best', id, fen, from, to, promotion, san, score, depth, nodes, pv }
  *        { type: 'info', depth, score, nodes }   after each completed depth
+ *
+ * `id` is echoed on every reply so the page can throw away an answer to a
+ * position it has already left (the user moved while the engine was thinking).
  */
 
 import { Chess } from '../vendor/chess.js';
@@ -194,7 +197,7 @@ self.onmessage = (e) => {
   try {
     game.load(msg.fen);
   } catch {
-    self.postMessage({ type: 'error', fen: msg.fen, error: 'bad fen' });
+    self.postMessage({ type: 'error', id: msg.id, fen: msg.fen, error: 'bad fen' });
     return;
   }
 
@@ -216,11 +219,12 @@ self.onmessage = (e) => {
   }
 
   if (!best) {
-    self.postMessage({ type: 'best', fen: msg.fen, from: null, to: null, score: 0, depth: 0, nodes });
+    self.postMessage({ type: 'best', id: msg.id, fen: msg.fen, from: null, to: null, score: 0, depth: 0, nodes });
     return;
   }
   self.postMessage({
     type: 'best',
+    id: msg.id,
     fen: msg.fen,
     from: best.from,
     to: best.to,
