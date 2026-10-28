@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>detection debug</title>
+<style>
+  body { background: #111; color: #ddd; font: 12px/1.45 ui-monospace, monospace; margin: 0; padding: 16px; }
+  canvas { display: block; border: 1px solid #444; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+const b = '?v=' + Date.now();
+const V = await import('../js/vision.js' + b);
+const { renderScene, makePose } = await import('./scene.js' + b);
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 480), H = +(qp.get('h') || 360);
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d');
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const pose = {
+  cx: W * +(qp.get('cx') ?? 0.5),
+  cy: H * +(qp.get('cy') ?? 0.5),
+  size: Math.min(W, H) * +(qp.get('size') ?? 0.6),
+  rot: +(qp.get('rot') ?? 0),
+  tilt: +(qp.get('tilt') ?? 0.35),
+};
+const quad = makePose(W, H, pose);
+const ARM = qp.get('arm') ? [{ pts: [[-0.5, 0.6], [2.4, 1.5], [5.4, 2.2], [8.4, 2.6]], width: 2.1 }] : null;
+renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 8, seed: 7, occluders: ARM });
+log(JSON.stringify(pose));
+log('GT ' + quad.map((p) => `(${p[0].toFixed(0)},${p[1].toFixed(0)})`).join(' '));
+
+const rgba = ctx.getImageData(0, 0, W, H).data;
+const prep = V.prepareFrame(rgba, W, H);
+const side = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+const err = (a) => {
+  if (!a) return '-';
+  let best = Infinity;
+  for (let s = 0; s < 4; s++) {
+    let d = 0;
+    for (let i = 0; i < 4; i++) d += Math.hypot(a[i][0] - quad[(i + s) % 4][0], a[i][1] - quad[(i + s) % 4][1]);
+    best = Math.min(best, d / 4);
+  }
+  return (best / side * 100).toFixed(1) + '%';
+};
+const describe = (q) => q.map((p) => `(${p[0].toFixed(0)},${p[1].toFixed(0)})`).join(' ');
+const show = (tag, q) => {
+  const s = V.scoreQuad(prep, W, H, q);
+  return `${tag} ${describe(q)} err=${err(q)} ${s ? `score=${s.score.toFixed(2)} trim=${s.trim().toFixed(2)} sep=${s.sep.toFixed(3)}` : 'NONE'}`;
+};
+
+log(show('GT    ', quad));
+for (const [name, mag, mw, mh] of [['mag4', prep.mag4, prep.sw4, prep.sh4], ['mag2', prep.mag2, prep.sw, prep.sh], ['mag1', prep.mag, W, H]]) {
+  const sx = W / mw, sy = H / mh;
+  const ls = V.houghLines(mag, mw, mh, 40);
+  log(`\n${name} ${mw}x${mh}: ${ls.length} lines`);
+  for (const l of ls.slice(0, 40)) log(`   theta=${l.theta.toFixed(0)} rho=${l.rho.toFixed(1)} votes=${(l.votes | 0)}`);
+  // which of the GT's four sides has a matching line?
+  for (let i = 0; i < 4; i++) {
+    const a = [quad[i][0] / sx, quad[i][1] / sy];
+    const c = [quad[(i + 1) % 4][0] / sx, quad[(i + 1) % 4][1] / sy];
+    const dx = c[0] - a[0], dy = c[1] - a[1];
+    let th = (Math.atan2(dx, -dy) * 180) / Math.PI;
+    if (th < 0) th += 180;
+    if (th >= 180) th -= 180;
+    const rho = a[0] * Math.cos((th * Math.PI) / 180) + a[1] * Math.sin((th * Math.PI) / 180);
+    let near = null;
+    for (const l of ls) {
+      let dT = Math.abs(l.theta - th);
+      if (dT > 90) dT = 180 - dT;
+      if (dT <= 2 && Math.abs(l.rho - rho) <= 5) { near = l; break; }
+    }
+    log(`   side${i}: theta=${th.toFixed(0)} rho=${rho.toFixed(1)} -> ${near ? `line votes=${near.votes | 0}` : 'MISSING'}`);
+  }
+  const qs = V.quadsFromLines(mag, mw, mh, +(qp.get('lines') || 56));
+  log(`   quadsFromLines: ${qs.length}`);
+  for (const q of qs.slice(0, +(qp.get('show') || 8))) {
+    const full = q.quad.map(([x, y]) => [x * sx, y * sy]);
+    log('   ' + show('cand', full));
+  }
+}
+const cands = V.candidateQuads(prep, W, H);
+log(`\ncandidateQuads: ${cands.length}`);
+for (const c of cands.slice(0, 8)) log(show('cand  ', c.quad));
+const det = V.detectQuad(prep, W, H);
+log(det ? show('detect', det.quad) + ` trimmed=${det.trimmed.toFixed(2)}` : 'detect null');
+const tr = new V.BoardTracker({ side: 'w' });
+const res = tr.update(rgba, W, H);
+log(`tracker: ${res.quad ? show('trk', res.quad) : 'null'} score=${res.score} trim=${res.scoreTrim}`);
+window.__done = true;
+</script>
+</body>
+</html>

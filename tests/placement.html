@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>board placement sweep</title>
+<style>
+  body { background: #111; color: #ddd; font: 12px/1.45 ui-monospace, monospace; margin: 0; padding: 16px; }
+  canvas { display: block; border: 1px solid #444; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="360"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+/*
+ * Does the detector find the board wherever it is in the frame?
+ *
+ * Three groups:
+ *   A  fully inside the frame, from a small corner of it to most of it,
+ *      upright, rotated and tilted                       — must all be found
+ *   B  a few percent of the board cropped by the frame   — must be found
+ *   C  a fifth of the board cropped                       — reported, best effort
+ *
+ * The error is the mean corner distance as a fraction of the board's side, so
+ * 6% means "within half a square" (a board is 8 squares across).
+ */
+const b = '?v=' + Date.now();
+const V = await import('../js/vision.js' + b);
+const { renderScene, makePose } = await import('./scene.js' + b);
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 480), H = +(qp.get('h') || 360);
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d');
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const frame = () => ctx.getImageData(0, 0, W, H).data;
+const MIN = Math.min(W, H);
+
+function quadError(a, b) {
+  if (!a || !b) return Infinity;
+  const bw = Math.hypot(b[1][0] - b[0][0], b[1][1] - b[0][1]);
+  let best = Infinity;
+  for (let s = 0; s < 4; s++) {
+    let d = 0;
+    for (let i = 0; i < 4; i++) d += Math.hypot(a[i][0] - b[(i + s) % 4][0], a[i][1] - b[(i + s) % 4][1]);
+    best = Math.min(best, d / 4);
+  }
+  return best / bw;
+}
+
+const cases = [];
+const frac = (v) => (W * v).toFixed(0) + ',' + (H * v).toFixed(0);
+const push = (group, tag, pose) => cases.push({ group, tag, pose });
+const bboxOf = (q) => {
+  const xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+  return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+};
+
+// A: fully inside, with a small margin so no edge is cut by the frame. Tilt
+// moves the *bounding box* of the board away from its centre, so the pose is
+// placed by the box it actually draws — otherwise a "corner" case is really a
+// clipped board, which is a different (documented) limit.
+const placeBy = (base) => {
+  const bb = bboxOf(makePose(W, H, base));
+  const halfW = (bb.x1 - bb.x0) / 2, halfH = (bb.y1 - bb.y0) / 2;
+  const offX = (bb.x0 + bb.x1) / 2 - W / 2, offY = (bb.y0 + bb.y1) / 2 - H / 2;
+  const m = W * 0.02;
+  const loX = halfW + m - offX, hiX = W - halfW - m - offX;
+  const loY = halfH + m - offY, hiY = H - halfH - m - offY;
+  if (loX > hiX || loY > hiY) return null;      // does not fit in the frame
+  return { loX, hiX, loY, hiY };
+};
+for (const size of [0.18, 0.25, 0.35, 0.5, 0.7, 0.85]) {
+  for (const rot of [0, 0.26, 0.52]) {
+    const base = { cx: W / 2, cy: H / 2, size: MIN * size, rot, tilt: 0.35 };
+    const box = placeBy(base);
+    if (!box) continue;
+    for (const dx of [-1, 0, 1]) {
+      for (const dy of [-1, 0, 1]) {
+        const cx = dx < 0 ? box.loX : dx > 0 ? box.hiX : (box.loX + box.hiX) / 2;
+        const cy = dy < 0 ? box.loY : dy > 0 ? box.hiY : (box.loY + box.hiY) / 2;
+        push('A', `${(size * 100) | 0}% r${(rot * 57.3) | 0}° @${cx.toFixed(0)},${cy.toFixed(0)}`,
+          { ...base, cx, cy });
+      }
+    }
+  }
+}
+// A2: steeper tilt, the phone up on a stand looking down at the table
+for (const size of [0.3, 0.5, 0.75]) {
+  const base = { cx: W / 2, cy: H / 2, size: MIN * size, rot: 0.15, tilt: 0.5 };
+  const box = placeBy(base);
+  if (!box) continue;
+  for (const dx of [-1, 0, 1]) {
+    const cx = dx < 0 ? box.loX : dx > 0 ? box.hiX : (box.loX + box.hiX) / 2;
+    const cy = (box.loY + box.hiY) / 2;
+    push('A', `${(size * 100) | 0}% tilt50 @${cx.toFixed(0)},${cy.toFixed(0)}`, { ...base, cx, cy });
+  }
+}
+// B/C: the board runs off an edge or a corner of the frame by a given fraction
+// of its own side. The pose is translated from the centred one, so the amount
+// outside the frame is exact.
+for (const [group, over, list] of [
+  ['B', 0.03, [[-1, 0], [1, 0], [0, -1], [0, 1], [-0.7, -0.7], [0.7, 0.7]]],
+  ['C', 0.2, [[-1, 0], [0, -1], [-0.7, -0.7]]],
+]) {
+  for (const size of [0.3, 0.5, 0.75]) {
+    if (group === 'C' && size === 0.3) continue;
+    const out = size * MIN * over;
+    const base = { cx: W / 2, cy: H / 2, size: MIN * size, rot: 0.1, tilt: 0.35 };
+    const bb = bboxOf(makePose(W, H, base));
+    for (const [dx, dy] of list) {
+      let cx = W / 2, cy = H / 2;
+      if (dx < 0) cx += -out - bb.x0;
+      if (dx > 0) cx += W + out - bb.x1;
+      if (dy < 0) cy += -out - bb.y0;
+      if (dy > 0) cy += H + out - bb.y1;
+      push(group, `${(size * 100) | 0}% ${(over * 100) | 0}%out ${dx},${dy}`,
+        { ...base, cx, cy });
+    }
+  }
+}
+
+const tally = {}, bad = {};
+let sumMs = 0;
+for (const c of cases) {
+  const quad = makePose(W, H, c.pose);
+  if (c.group === 'A') {
+    const gb = bboxOf(quad);
+    if (gb.x0 < 1 || gb.y0 < 1 || gb.x1 > W - 1 || gb.y1 > H - 1) {
+      log(`  placement bug: ${c.tag} box ${gb.x0.toFixed(0)},${gb.y0.toFixed(0)}..${gb.x1.toFixed(0)},${gb.y1.toFixed(0)}`);
+    }
+  }
+  renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 8, seed: 7 });
+  const tr = new V.BoardTracker({ side: 'w' });
+  const t0 = performance.now();
+  const res = tr.update(frame(), W, H);
+  const ms = performance.now() - t0;
+  sumMs += ms;
+  const err = quadError(res.quad, quad);
+  const good = !!res.quad && err < 0.06;
+  const t = tally[c.group] || (tally[c.group] = { ok: 0, n: 0 });
+  t.n++;
+  if (good) t.ok++;
+  else {
+    (bad[c.group] || (bad[c.group] = [])).push(`${c.tag} err=${isFinite(err) ? (err * 100).toFixed(1) + '%' : '-'} score=${res.score.toFixed(1)} ${ms.toFixed(0)}ms pose=${JSON.stringify(c.pose)}`);
+  }
+  log(`${good ? 'ok  ' : 'FAIL'} ${c.group} ${c.tag.padEnd(26)} err=${isFinite(err) ? (err * 100).toFixed(1) + '%' : '-'} score=${res.score.toFixed(1)} trim=${res.scoreTrim.toFixed(1)} ${ms.toFixed(0)}ms`);
+}
+
+for (const g of ['A', 'B', 'C']) {
+  const t = tally[g];
+  if (t) log(`\n${g}: ${t.ok}/${t.n} found`);
+  for (const f of (bad[g] || []).slice(0, 10)) log('  ' + f);
+}
+log(`\nmean ${(sumMs / cases.length).toFixed(0)} ms/frame`);
+window.__summary = { tally, bad, meanMs: sumMs / cases.length };
+window.__done = true;
+</script>
+</body>
+</html>

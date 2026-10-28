@@ -16,7 +16,8 @@
 <script type="module">
 import { Chess } from '../vendor/chess.js';
 import {
-  BoardTracker, boardHomography, describeBoard, describeSquares, grayFromRGBA, project, scoreQuad, squareDiff, median, prepare,
+  BoardTracker, BoardSampler, boardHomography, describeBoard, describeSquares, grayFromRGBA,
+  prepare, project, scoreQuad, squareDiff, median,
 } from '../js/vision.js';
 import { renderScene, makePose } from './scene.js';
 import { MoveReader, inferMove, indexSquare } from '../js/track.js';
@@ -50,6 +51,23 @@ function quadError(a, b) {
     best = Math.min(best, s / 4);
   }
   return best;
+}
+
+/**
+ * Read one frame the way the app does: describe the squares on the anchored
+ * sampling grid, push it to the reader, and — while nothing is changing — let
+ * the reference follow the board so the grid stays on its squares.
+ */
+function sample(res, sampler, reader) {
+  const desc = sampler.see(res.prepared, W, H, res);
+  if (!reader) return { r: null, desc };
+  const r = reader.push(desc, { gridMoved: res.gridMoved });
+  if (!r.settled && !r.stuck && !r.changed.size && sampler.drift(res) > 0.04) {
+    const fresh = sampler.refresh(res.prepared, W, H, res);
+    reader.commit(fresh);
+    return { r, desc: fresh };
+  }
+  return { r, desc };
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,6 +119,11 @@ for (const side of ['w', 'b']) {
   const gray = grayFromRGBA(rgba, W, H);
   const tr = new BoardTracker({ side });
   const res = tr.update(rgba, W, H);
+  if (!res.H) {
+    const gtsc = scoreQuad(prepare(gray, W, H), W, H, quad);
+    log(`side ${side}: NO LOCK gt=${gtsc ? gtsc.score.toFixed(2) + '/' + gtsc.trim().toFixed(2) : 'none'}`);
+    continue;
+  }
   const desc = describeBoard(res.prepared, W, H, res.H);
   const mean = (i) => { let s = 0; for (let k = 0; k < 9; k++) s += desc[i * 9 + k]; return s / 9; };
   const rank1 = Array.from({ length: 8 }, (_, i) => mean(i).toFixed(0)).join(' ');
@@ -135,6 +158,7 @@ log('\n=== 3. move reading ===');
 const moves = ['e4', 'c5', 'Nf3', 'd6', 'd4', 'cxd4', 'Nxd4', 'Nf6', 'Nc3', 'a6', 'Be3', 'e6', 'f3', 'b5', 'Qd2', 'Nbd7', 'g4', 'h6', 'O-O-O', 'Bb7'];
 const quad = makePose(W, H, { tilt: 0.26, size: Math.min(W, H) * 0.8 });
 const tracker = new BoardTracker({ side: 'w' });
+const sampler = new BoardSampler();
 const reader = new MoveReader();
 const game = new Chess();
 
@@ -142,7 +166,7 @@ renderScene(ctx, { w: W, h: H, fen: game.fen(), quad, border: 0.02, light: 0.04,
 let rgba = frame();
 let res = tracker.update(rgba, W, H);
 let gray = grayFromRGBA(rgba, W, H);
-reader.commit(describeBoard(res.prepared, W, H, res.H));
+reader.commit(sampler.see(res.prepared, W, H, res));
 
 let pass = 0;
 for (const san of moves) {
@@ -155,9 +179,8 @@ for (const san of moves) {
     rgba = frame();
     res = tracker.update(rgba, W, H);
     gray = grayFromRGBA(rgba, W, H);
-    const desc = res.H ? describeBoard(res.prepared, W, H, res.H) : null;
+    const { r, desc } = res.H ? sample(res, sampler, reader) : { r: null, desc: null };
     if (!desc) { note = 'no board'; continue; }
-    const r = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
     trace.push(`f${f}:qs${res.quadShift.toFixed(2)}:mt${res.motion.toFixed(0)}:n${r.changed.size}${r.settled ? 'S' : ''}${r.rebased ? 'R' : ''}`);
     if (!r.settled) continue;
     const inf = inferMove(legal, r.changed);
@@ -238,6 +261,7 @@ const HAND = { pts: [[-0.6, 5.2], [1.8, 6.4], [2.6, 7.6]], width: 2.4 };
   const game = new Chess();
   const tr = new BoardTracker({ side: 'w' });
   const reader = new MoveReader();
+  const sampler = new BoardSampler();
   const shot = (fen, occ) => {
     renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: 9, seed: 31, occluders: occ });
   };
@@ -247,16 +271,16 @@ const HAND = { pts: [[-0.6, 5.2], [1.8, 6.4], [2.6, 7.6]], width: 2.4 };
       shot(game.fen(), occ);
       const res = tr.update(frame(), W, H);
       if (!res.H) return null;
-      const desc = describeBoard(res.prepared, W, H, res.H);
-      last = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
-      if (last.settled || last.stuck) return { r: last, desc, res };
+      const { r, desc } = sample(res, sampler, reader);
+      last = r;
+      if (last.settled || last.stuck) return { r: last, desc };
     }
-    return { r: last, desc: null, res: null };
+    return { r: last, desc: null };
   };
 
   shot(game.fen(), null);
   let res = tr.update(frame(), W, H);
-  reader.commit(describeBoard(res.prepared, W, H, res.H));
+  reader.commit(sampler.see(res.prepared, W, H, res));
   const legalBefore = game.moves({ verbose: true });
   const want = game.move('Nf3');
   // hand parks on the board first, then the knight moves underneath it
@@ -276,6 +300,7 @@ const HAND = { pts: [[-0.6, 5.2], [1.8, 6.4], [2.6, 7.6]], width: 2.4 };
   const game = new Chess();
   const tr = new BoardTracker({ side: 'w' });
   const reader = new MoveReader();
+  const sampler = new BoardSampler();
   const shot = (fen, occ) => {
     renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: 9, seed: 41, occluders: occ });
   };
@@ -285,15 +310,15 @@ const HAND = { pts: [[-0.6, 5.2], [1.8, 6.4], [2.6, 7.6]], width: 2.4 };
       shot(game.fen(), occ);
       const res = tr.update(frame(), W, H);
       if (!res.H) return null;
-      const desc = describeBoard(res.prepared, W, H, res.H);
-      last = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
+      const { r, desc } = sample(res, sampler, reader);
+      last = r;
       if (last.settled || last.stuck) return { r: last, desc };
     }
     return { r: last, desc: null };
   };
   shot(game.fen(), null);
   const r0 = tr.update(frame(), W, H);
-  reader.commit(describeBoard(r0.prepared, W, H, r0.H));
+  reader.commit(sampler.see(r0.prepared, W, H, r0));
   const legalBefore = game.moves({ verbose: true });
   const want = game.move('Nf3');
   step(3, [HAND]);
@@ -354,6 +379,51 @@ let falseLocks = 0;
     log(`  scene ${i}: ${res.quad ? 'LOCKED (bad)' : 'no lock'} score=${res.score.toFixed(1)} trim=${res.scoreTrim.toFixed(1)}`);
   });
   log(`  false locks: ${falseLocksInScene}/${scenes.length}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* 6. board anywhere: the same board in every corner of the frame      */
+/* ------------------------------------------------------------------ */
+log('\n=== 6. board anywhere ===');
+{
+  const bbox = (q) => {
+    const xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+    return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+  };
+  let ok6 = 0, n6 = 0;
+  const fails6 = [];
+  for (const size of [0.35, 0.5, 0.72]) {
+    for (const rot of [0, 0.4]) {
+      const base = { cx: W / 2, cy: H / 2, size: Math.min(W, H) * size, rot, tilt: 0.3 };
+      const bb = bbox(makePose(W, H, base));
+      const halfW = (bb.x1 - bb.x0) / 2, halfH = (bb.y1 - bb.y0) / 2;
+      const offX = (bb.x0 + bb.x1) / 2 - W / 2, offY = (bb.y0 + bb.y1) / 2 - H / 2;
+      const m = W * 0.02;
+      const loX = halfW + m - offX, hiX = W - halfW - m - offX;
+      const loY = halfH + m - offY, hiY = H - halfH - m - offY;
+      if (loX > hiX || loY > hiY) continue;
+      for (const [px, py] of [[loX, loY], [hiX, loY], [loX, hiY], [hiX, hiY], [(loX + hiX) / 2, (loY + hiY) / 2]]) {
+        const quad = makePose(W, H, { ...base, cx: px, cy: py });
+        renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 8, seed: 11 });
+        const tr = new BoardTracker({ side: 'w' });
+        const res = tr.update(frame(), W, H);
+        n6++;
+        const bw = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+        const rel = quadError(res.quad, quad) / bw;
+        let ori = false;
+        if (res.H) {
+          const desc = describeBoard(res.prepared, W, H, res.H);
+          const mean = (i) => { let s = 0; for (let k = 0; k < 9; k++) s += desc[i * 9 + k]; return s / 9; };
+          ori = mean(0) < mean(7);
+        }
+        if (res.quad && rel < 0.06 && ori) ok6++;
+        else fails6.push(`${(size * 100) | 0}% r${(rot * 57.3) | 0}° @${px.toFixed(0)},${py.toFixed(0)}`
+          + (res.quad ? ` err=${(rel * 100).toFixed(1)}%${ori ? '' : ' ORIENTATION'}` : ' no lock'));
+      }
+    }
+  }
+  log(`  board anywhere: ${ok6}/${n6} found in place with the right orientation`);
+  for (const f of fails6.slice(0, 5)) log(`   ${f}`);
 }
 
 log('\ndone');

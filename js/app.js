@@ -7,7 +7,7 @@
  */
 
 import { Chess } from '../vendor/chess.js';
-import { BoardTracker, describeBoard, project } from './vision.js';
+import { BoardTracker, BoardSampler, project } from './vision.js';
 import { MoveReader, inferMove } from './track.js';
 
 const MAX_EDGE = 720;          // detection resolution, long edge
@@ -35,6 +35,7 @@ let suggestion = null;         // { from, to, san, score, depth }
 let worker = null;
 let thinking = false;
 let lastDesc = null;           // descriptor of the last sampled frame
+const sampler = new BoardSampler();   // the grid descriptors are sampled on
 let frames = 0;
 let stepMs = 0;                // duration of the last processed frame
 let stepAvg = 0;               // smoothed duration, for the on-device readout
@@ -204,17 +205,25 @@ function step(now) {
     // the descriptor is exactly the previous one: reuse it instead of sampling
     // 64 squares again.
     let desc;
-    if (res.still && lastDesc && res.quadShift <= 0.25) {
+    if (res.still && lastDesc) {
       desc = lastDesc;
     } else {
-      desc = describeBoard(res.prepared, vw, vh, res.H);
+      desc = sampler.see(res.prepared, vw, vh, res);
       lastDesc = desc;
     }
-    const r = reader.push(desc, { gridMoved: res.quadShift > 0.25, now: performance.now() });
+    const r = reader.push(desc, { gridMoved: res.gridMoved, now: performance.now() });
     occluded = !!r.implausible;
     if (r.settled || r.stuck) readBoard(desc, r);
+    else if (!r.changed.size && sampler.drift(res) > 0.04) {
+      // Nothing is changing, so the reference can follow the board: move the
+      // sampling grid onto the squares it is sampling and re-base from there.
+      // Doing this while a change is pending would throw that change away.
+      lastDesc = sampler.refresh(res.prepared, vw, vh, res);
+      reader.commit(lastDesc);
+    }
   } else {
     lastDesc = null;
+    sampler.reset();
     occluded = false;
   }
 
@@ -421,6 +430,7 @@ sideSel.addEventListener('change', () => {
   tracker = new BoardTracker({ side: sideSel.value });
   reader = new MoveReader();
   lastDesc = null;
+  sampler.reset();
   suggestion = null;
   setStatus('Switched side — hold the board in view', '');
   askEngine();
@@ -430,6 +440,7 @@ document.getElementById('resync').addEventListener('click', () => {
   game = new Chess();
   reader = new MoveReader();
   lastDesc = null;
+  sampler.reset();
   suggestion = null;
   setStatus('Reset to the start position', 'ok');
   askEngine();
@@ -440,6 +451,7 @@ document.getElementById('undo').addEventListener('click', () => {
     suggestion = null;
     reader = new MoveReader();
     lastDesc = null;
+    sampler.reset();
     setStatus(`Took back to move ${game.history().length}`, '');
     askEngine();
   }

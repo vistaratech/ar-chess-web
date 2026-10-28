@@ -10,6 +10,10 @@ Live: <https://ar-chess-web.vercel.app>
 
 - **Automatic board detection.** No calibration step. As soon as the camera opens
   the app looks for the board and outlines it.
+- **Wherever the board is.** The search runs over the whole frame at three scales,
+  so a board in a corner, half off to one side, small because the phone is across
+  the table, or filling the picture are all the same case. Nothing about the last
+  position biases the first search.
 - **Continuous tracking.** The outline follows the board while the phone moves,
   rotates or changes angle. The local re-fit is predicted from the last few
   frames, so a pan does not lag a frame behind; a bigger change re-runs the full
@@ -21,7 +25,9 @@ Live: <https://ar-chess-web.vercel.app>
   played *under* a resting hand is read as soon as the hand lifts.
 - **Move reading.** After the board has been still for two frames, the squares
   that changed appearance are matched against the legal moves of the current
-  position, and the move is played in the app's own game state.
+  position, and the move is played in the app's own game state. The squares are
+  sampled on a grid that is *kept* between frames and only moved when the board
+  itself moves, so a sub-pixel re-fit cannot fake a change on a dozen squares.
 - **AR suggestion.** The engine (alpha-beta, quiescence, iterative deepening, in a
   Web Worker) returns the best move for the side to move; it is drawn as an arrow
   with the destination square ringed and the evaluation in the status bar.
@@ -40,9 +46,20 @@ opening, so the whole pipeline can be watched on a desktop.
   ship. Use **Resync** to return to the start position.
 - Detection is a classical computer-vision pipeline (Hough lines, pyramid,
   colour-parity scoring, ridge snapping), not a neural network. It is reliable for
-  a visible board with reasonable contrast and light; it can fail on extreme
-  perspective (a strongly foreshortened far edge), heavy clutter, or when the
-  board fills none of the frame.
+  a visible board with reasonable contrast and light; it can fail on heavy clutter
+  or extreme perspective (a strongly foreshortened far edge).
+- **How small is too small?** What matters is the size of a *square* in the frame
+  the app processes (the camera frame is scaled down to at most 720 px on the long
+  edge). At 11 px per square and up — a board at ~25 % of the short side —
+  detection is occasional (about 3 in 4 poses in the sweep below); at 12 px and up
+  (~35 %) it is essentially certain, and at 20 px (~50 %) it never missed in the
+  sweep. Below ~10 px per square the board's rim is softer than the squares inside
+  it and the search stops finding it — at that size the pieces are a few pixels
+  across and there is nothing left to read anyway.
+- **A board cut by the edge of the frame is not supported.** The rim is what the
+  detector locks onto, and a side that runs off the picture has no edge to find.
+  A board cropped by 3 % is found about two times in three, one cropped by 20 %
+  never is. Keep the whole board in view.
 - **The first lock wants most of the board.** A hand or a forearm over a corner or
   an edge is fine (6/6 poses in the test suite), but if half the board is covered
   at the moment the camera opens the app keeps searching until it can see enough
@@ -86,13 +103,22 @@ tests/               synthetic scenes and diagnostic pages
    and ¼ scale, with Sobel magnitudes at each level. At ¼ scale the inner grid has
    averaged away and the board's rim is the strongest structure in the image —
    which is exactly what makes the outer edge findable, and makes the search
-   cheap.
+   cheap. Levels are tried coarsest first and the search stops the moment a
+   candidate is decisive; a score-guided fit is run on the best coarse candidate
+   for that reason, because a coarse ridge snap cannot correct a *scale* error.
 2. **Hough.** A coarse Hough transform (180 angles, weighted votes) returns the top
-   peaks at each level.
+   peaks at each level. Up to 56 lines are kept, and peaks that are the same
+   physical edge spread over a few degrees (a short edge, a thick line) are merged
+   with a deliberately narrow window: wide enough to collapse a fan, narrow enough
+   that the four sides of a small board stay four lines.
 3. **Families.** The peaks are split into the two perpendicular line families of a
    board grid by weighted angle voting, and every pair of one family is crossed
-   with every pair of the other. Pairs closer than a fifth of the frame are
-   dropped first: a board side spans several cells.
+   with every pair of the other. Pairs too close to hold cells between them are
+   dropped first (a board side spans several cells), the pair lists are capped, and
+   the resulting quads are capped and then **interleaved by size class**: the
+   biggest quads first, the best of the smaller ones between them. Without that a
+   table edge or a doorway fills every slot and a board across the room is never
+   scored.
 4. **Snap.** Each candidate side is snapped onto the strongest long straight
    gradient ridge (a global offset+angle search, immune to the short curved edges
    of pieces), first coarse then at half-pixel resolution. Each side is scored in
@@ -102,40 +128,49 @@ tests/               synthetic scenes and diagnostic pages
    middle, not the corners) and the samples are high-passed against their 3×3
    neighbourhood before the two alternating classes are compared. That normal-
    isation cancels uneven lighting and vignetting, which otherwise swamps the
-   spread on real cameras. A candidate is judged by the strict score, and — if
-   that fails — by the same measurement with the cells that fit neither colour
-   removed, at a much higher bar (a *near* board never reaches it, a *covered*
-   board does). A score-guided fit (scale, then centre) is run once on the best
-   candidate, because a bordered board or a row of pieces along an edge can make
-   the strongest ridge the wrong ridge.
+   spread on real cameras. The separation is normalised by an estimate of how much
+   contrast this cell size can show — small squares mix their neighbours, so the
+   same board scores lower when it is far away — and a board clipped by the frame
+   is scored only on the cells that are actually visible. A candidate is judged by
+   the strict score, and — if that fails — by the same measurement with the cells
+   that fit neither colour removed, at a much higher bar (a *near* board never
+   reaches it, a *covered* board does). A score-guided fit (scale, then centre) is
+   run once on the best candidate, because a bordered board or a row of pieces
+   along an edge can make the strongest ridge the wrong ridge. If everything is
+   about to be rejected, the rest of each level's candidate list gets scored
+   before giving up: a failed search has already paid for the transforms, so that
+   is where extra recall is free.
 6. **Track.** Once locked, the grid is *frozen* while the frame is still. On a
    moving frame it is re-fitted from the predicted position (last quad plus the
    smoothed corner velocity), and the fit is accepted on the trimmed score, so a
-   hand over the board does not break the lock. The grid only moves when the fit
-   actually moved by a whole pixel — re-fitting a static board is what makes
-   square descriptors wobble. Re-detection happens only when the trimmed score
-   also collapses, and a detection that lands on the board already held is
-   ignored rather than applied.
+   hand over the board does not break the lock. The grid only counts as moved when
+   it moved by a fifth of a square, and the square sampling grid is *anchored*:
+   descriptors are taken on the last confirmed grid and only re-anchored when the
+   board itself moved. Between moves the anchor is allowed to follow the board
+   (re-basing at the same time), so it never drifts away from the squares while a
+   move is being read. Re-detection happens only when the trimmed score also
+   collapses, and a detection that lands on the board already held is ignored
+   rather than applied.
 
 ## Performance
 
 The loop is built so that a frame costs work only in proportion to how much
-actually changed. Measured at 640×360 in a desktop Chrome, per frame:
+actually changed. Per frame, measured in desktop Chrome at 480×270 and 720×405
+(the two figures are those two sizes):
 
-| what | before | after |
-| --- | --- | --- |
-| frame where nothing moved | 28 ms | **0.2 ms** |
-| frame with a piece/camera change | 28 ms | **2.6 ms** |
-| the same, with an arm over the board | — | **2.6 ms** |
-| first lock (search + refine) | ~40 ms | **11 ms** |
-| 14-pose detection suite, mean | 71 ms | **37–48 ms** |
+| what | cost |
+| --- | --- |
+| frame where nothing moved (thumbnail diff only) | **0.6 / 1.3 ms** |
+| the same, end to end in the app, camera readback included | **1.7 / 3.9 ms** |
+| moving frame: re-fit the grid + sample 64 squares | **12 / 32 ms** |
+| full search: first lock, or after the board is lost | **40 / 58 ms** |
+| a board with an arm lying across it | no extra cost |
 
-(28 ms was `prepare` + the 64-square descriptor, which the old loop computed on
-every processed frame; 0.2 ms is a still frame that only diffs a thumbnail. The
-moving frame grew from 1.6 ms to 2.6 ms because the grid is now re-fitted on every
-moving frame instead of only when the score had already degraded — that is what
-keeps the overlay glued to the board during a pan — and it includes building the
-full-resolution gradient the fit needs. 30 fps still costs under 8 % of a core.)
+The search is the only expensive part, and it is not on the per-frame path: while
+locked it runs only when the trimmed score also collapses. A still board costs a
+thumbnail and nothing else. (These numbers come from a software-rendered Chrome
+on a VM and are 2–3× slower than the same code on a phone; the share of each
+stage is what is worth reading.)
 
 What made the difference:
 
@@ -147,6 +182,10 @@ What made the difference:
   scale, so the gate is safe.
 - **Gradients are built lazily.** The Sobel maps are only needed for detection
   and ridge snapping, so a frame that is merely tracked pays nothing for them.
+- **The search stops at the coarser scale.** A full-resolution Hough is ~10× the
+  quarter-scale one, so a decisive candidate at ¼ or ½ scale ends the search
+  there; the score-guided fit at that level is what makes the coarse candidate
+  decisive in the first place.
 - **Buffers rotate instead of allocating.** Two scratch sets per resolution are
   reused, so a running camera generates no garbage and the collector never has a
   reason to interrupt the loop.
@@ -158,9 +197,9 @@ What made the difference:
 - **Frames are consumed as the camera produces them** (`requestVideoFrameCallback`)
   rather than on every animation frame, so no frame is drawn or sampled twice.
 - **A covered board costs nothing extra.** Tracking a board with an arm lying on
-  it is the same 2.6 ms as tracking a clear one: the trimmed score is computed
+  it is the same cost as tracking a clear one: the trimmed score is computed
   lazily, only when the strict one is low, and a hand never triggers a re-search
-  (a re-search that cannot succeed would run every frame at ~30 ms).
+  (a re-search that cannot succeed would run every frame).
 
 ## Tests
 
@@ -174,23 +213,47 @@ no phone required.
   - reading 20 consecutive moves of a real opening,
   - detection with a hand over a corner, tracking through a pan with a whole
     forearm lying across the board, a move played under a hand, a move played out
-    of a hand, and four scenes with no board at all (which must *not* lock).
+    of a hand, and four scenes with no board at all (which must *not* lock),
+  - the same board in every corner of the frame at three sizes and two rotations,
+    which must be found *and* named the right way round.
 
-  Current result, identical at 480×270, 720×405 and 405×720: **detection 14/14**
-  (mean 37–48 ms per detection), **corner occluded 6/6**, **pan + arm 18/18
-  followed, 0 locks lost, worst corner error 0.3–1.4 % of board width**,
-  **move reading 20/20**, **moves under/out of a hand read correctly**,
-  **false locks 0/4**.
+  Current result, at 480×270 / 720×405 / 405×720: **detection 14/14** (mean 33–44 ms
+  per detection, readback included), **orientation correct both sides**,
+  **corner occluded 6/6**, **pan + arm 18/18 followed, 0 locks lost, worst corner
+  error 0.3–0.4 % of board width**, **move reading 20/20**, **moves under/out of a
+  hand read correctly**, **false locks 0/4**, **board anywhere 29/30, 30/30, 30/30**.
+
+- `tests/placement.html` — how much of the frame a board may occupy and where it
+  may sit. Group A places the board fully inside the frame (by its real bounding
+  box, so tilt cannot push a corner out) at 18–85 % of the short side, nine
+  positions, three rotations, plus a steeper tilt; group B crops 3 % of it by an
+  edge; group C crops 20 %.
+
+  Current result at 480×360 (equivalent to a board 65–306 px across in a frame the
+  app actually processes):
+
+  | board size | found |
+  | --- | --- |
+  | 85 % of the short side | 9/9 |
+  | 70 % | 27/27 |
+  | 50 % | 30/30 |
+  | 35 % | 27/27 |
+  | 25 % | 20/27 |
+  | 18 % | 1/27 |
+
+  Group B 13/18, group C 0/6. At 720×405 and 405×720 the same sweep gives the same
+  shape (25 % improves to 26/27 and 25/27; 18 % stays hopeless), which is why the
+  README states the limit in pixels per square rather than as a percentage.
 
 - `tests/perf.html` — per-stage timing at any resolution, plus the motion-gate
   calibration table (identical frame / re-seeded noise / 1 px / 2 px / 6 px shift
   / a moved pawn).
-
-- `tests/debug7.html` — per-pose candidate table (raw/snap error, score, gap) and
-  a Hough line dump.
-- `tests/debug9.html` — per-square descriptor differences for a sequence of moves;
-  the tool that showed why a white pawn on a light square needed a shape term.
-- `tests/debug10.html` — renderer determinism and grid drift.
+- `tests/_place_debug.html` — one pose at a time: the ground-truth score, the Hough
+  lines near each board side, the candidate quads and what `detectQuad` returns.
+- `tests/_det_perf.html` — what each pyramid level costs (Hough, quads, search) and
+  the score of its candidates, which is how the search budget was chosen.
+- `tests/_hand.html` — the "move under a hand" case frame by frame, with the change
+  set, the grid shift and the descriptor diff printed for each frame.
 - `tests/engine.html` — engine sanity checks (mate in one, legal replies, timing).
 
 ## A note on the economic part of "best move"

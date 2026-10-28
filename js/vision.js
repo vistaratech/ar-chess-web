@@ -348,7 +348,13 @@ export function houghLines(mag, w, h, maxLines = 20) {
     for (const q of kept) {
       let dT = Math.abs(p.theta - q.theta);
       if (dT > 90) dT = 180 - dT;
-      if (dT <= 1 && Math.abs(p.rho - q.rho) <= 6) { ok = false; break; }
+      // A thick edge, or an edge that is not perfectly straight, spreads over
+      // several degrees of the accumulator as soon as the line is short, so the
+      // same physical edge shows up as a fan of peaks. Merging them is what
+      // keeps the list to *distinct* lines — but the window must stay narrow:
+      // at quarter scale the four sides of a small board are only ~16 bins
+      // apart, and a wide window would merge a side with the grid inside it.
+      if (dT <= 4 && Math.abs(p.rho - q.rho) <= 8) { ok = false; break; }
     }
     if (ok) kept.push(p);
     if (kept.length >= maxLines) break;
@@ -409,22 +415,54 @@ function orderByAngle(pts) {
   return idx.map((i) => pts[i]);
 }
 
+/**
+ * How much of a quad's bounding box is still inside the frame (0..1+).
+ *
+ * Cheap filter for "is any of this quad in the picture at all". It uses the
+ * bounding box rather than the quad itself, so it over-reads for a quad that is
+ * rotated 45 degrees, which only makes it more permissive; the colour score is
+ * what decides whether a quad is a board.
+ */
+function frameFrac(q, w, h) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of q) {
+    if (x < x0) x0 = x;
+    if (y < y0) y0 = y;
+    if (x > x1) x1 = x;
+    if (y > y1) y1 = y;
+  }
+  const iw = Math.min(x1, w) - Math.max(x0, 0);
+  const ih = Math.min(y1, h) - Math.max(y0, 0);
+  if (iw <= 0 || ih <= 0) return 0;
+  return (iw * ih) / ((x1 - x0) * (y1 - y0));
+}
+
+/**
+ * Could this shape be a chessboard seen through this camera?
+ *
+ * A board can be *anywhere* in the frame — hard against an edge, or with a
+ * corner or two cropped by the frame — so corners are allowed to fall outside.
+ * What is still required: four convex corners, enough of the quad inside the
+ * picture to be measurable, a roughly square aspect (perspective can shorten
+ * one side a lot), and a size big enough to see squares in. All of these are
+ * deliberately loose; the colour score does the real work.
+ */
 export function validQuad(q, w, h) {
   const area = quadArea(q);
-  if (area < w * h * 0.05 || area > w * h * 1.05) return false;
+  if (area < w * h * 0.006 || area > w * h * 1.05) return false;
   if (!isConvex(q)) return false;
-  const m = 0.08;
-  for (const [x, y] of q) {
-    if (x < -w * m || y < -h * m || x > w * (1 + m) || y > h * (1 + m)) return false;
-  }
+  // a quad entirely off-screen has nothing to measure
+  if (frameFrac(q, w, h) < 0.35) return false;
   let mn = Infinity, mx = 0;
   for (let i = 0; i < 4; i++) {
     const [x1, y1] = q[i], [x2, y2] = q[(i + 1) % 4];
     const len = Math.hypot(x2 - x1, y2 - y1);
     mn = Math.min(mn, len); mx = Math.max(mx, len);
   }
-  if (mn < Math.min(w, h) * 0.16) return false;
-  if (mx / mn > 2.8) return false;
+  // Down to a board that is a small part of the frame (a phone propped up at
+  // the end of a table), but not so small that the squares average together.
+  if (mn < Math.max(18, Math.min(w, h) * 0.05)) return false;
+  if (mx / mn > 3.0) return false;
   return true;
 }
 
@@ -468,38 +506,73 @@ export function scoreQuad(prepared, w, h, quad) {
   const H = solveHomography(BOARD_SRC, quad);
   if (!H) return null;
 
+  // How many pixels a square covers. A board seen from across the room has
+  // 8-pixel squares; the 1-2-1 blur, the sampling offsets and the pieces all
+  // mix a little of the neighbouring square into every sample, so the spread
+  // inside each colour class grows as the squares shrink. Normalising by a
+  // sampling-size-dependent floor keeps one threshold valid for both a board
+  // that fills the frame and one that occupies a corner of it.
+  let minSide = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const [x1, y1] = quad[i], [x2, y2] = quad[(i + 1) % 4];
+    minSide = Math.min(minSide, Math.hypot(x2 - x1, y2 - y1));
+  }
+  const cellPx = minSide / BOARD;
+  const eps = 0.04 * Math.max(0.28, Math.min(1, cellPx / 20));
+
   const off = 0.18;
   const pts = [[off, off], [1 - off, off], [1 - off, 1 - off], [off, 1 - off]];
   const vals = new Float32Array(64);
   const four = [0, 0, 0, 0];
+  // A board can hang over the edge of the frame, so cells whose samples land
+  // outside the picture are left out instead of failing the whole quad. The
+  // mask is only allocated for that (rare) case; a fully visible board — every
+  // frame of a locked one — takes the same path as before.
+  let vis = null;
+  let visible = 0;
 
   for (let r = 0; r < BOARD; r++) {
     for (let f = 0; f < BOARD; f++) {
+      const idx = r * 8 + f;
+      let ok = true;
       for (let i = 0; i < 4; i++) {
         const p = project(H, f + pts[i][0], r + pts[i][1]);
         const v = p ? sampleBilinear(gray, w, h, p[0], p[1]) : null;
-        if (v === null) return null;
+        if (v === null) { ok = false; break; }
         four[i] = v;
       }
+      if (!ok) {
+        if (!vis) vis = new Uint8Array(64).fill(1);
+        vis[idx] = 0;
+        continue;
+      }
+      visible++;
       four.sort((a, b) => a - b);
-      vals[r * 8 + f] = (four[1] + four[2]) * 0.5;
+      vals[idx] = (four[1] + four[2]) * 0.5;
     }
   }
+  // Too little of the board in shot: the score would be measuring the frame
+  // edge rather than the board.
+  if (visible < 24) return null;
 
   // high-pass against the 3x3 neighbourhood
   const norm = new Float32Array(64);
   for (let r = 0; r < 8; r++) {
     for (let f = 0; f < 8; f++) {
+      const idx = r * 8 + f;
+      if (vis && !vis[idx]) continue;
       let s = 0, n = 0;
       for (let dr = -1; dr <= 1; dr++) {
         for (let df = -1; df <= 1; df++) {
           const rr = r + dr, ff = f + df;
           if (rr < 0 || rr > 7 || ff < 0 || ff > 7) continue;
-          s += vals[rr * 8 + ff]; n++;
+          const j = rr * 8 + ff;
+          if (vis && !vis[j]) continue;
+          s += vals[j]; n++;
         }
       }
       const m = s / n;
-      norm[r * 8 + f] = (vals[r * 8 + f] - m) / (Math.abs(m) + 12);
+      norm[idx] = (vals[idx] - m) / (Math.abs(m) + 12);
     }
   }
 
@@ -518,13 +591,13 @@ export function scoreQuad(prepared, w, h, quad) {
   //
   // The trimmed pass is lazy on purpose: detection scores dozens of candidate
   // quads per frame and only needs the strict number to rank them.
-  const all = classStats(norm, null);
-  const score = all.sep / (all.sdA + all.sdB + 0.04);
+  const all = classStats(norm, null, vis);
+  const score = all.sep / (all.sdA + all.sdB + eps);
   let trimScore = -1;
   return {
-    h: H, mA: all.mA, mB: all.mB, sdA: all.sdA, sdB: all.sdB, sep: all.sep, score,
+    h: H, mA: all.mA, mB: all.mB, sdA: all.sdA, sdB: all.sdB, sep: all.sep, score, cell: cellPx,
     trim() {
-      if (trimScore < 0) trimScore = trimmedScore(norm, all);
+      if (trimScore < 0) trimScore = trimmedScore(norm, all, vis, eps);
       return trimScore;
     },
   };
@@ -534,13 +607,15 @@ const keepA = new Uint8Array(64);
 const keepB = new Uint8Array(64);
 
 /** Colour separation after throwing out the cells that fit neither class. */
-function trimmedScore(norm, all) {
+function trimmedScore(norm, all, vis, eps) {
   let keep = null;
   let st = all;
+  const minKeep = Math.min(40, Math.round(0.62 * (all.na + all.nb)));
   for (let round = 0; round < 2; round++) {
     const nk = round === 0 ? keepA : keepB;
     let n = 0;
     for (let i = 0; i < 64; i++) {
+      if (vis && !vis[i]) { nk[i] = 0; continue; }
       const odd = ((i % 8) + (i >> 3)) & 1;
       const m = odd ? st.mB : st.mA;
       const sd = Math.max(odd ? st.sdB : st.sdA, 0.03);
@@ -548,26 +623,27 @@ function trimmedScore(norm, all) {
       nk[i] = on;
       n += on;
     }
-    if (n < 40) break;
+    if (n < minKeep) break;
     keep = nk;
     st = classStats(norm, keep);
   }
-  if (!keep) return all.sep / (all.sdA + all.sdB + 0.04);
-  return st.sep / (st.sdA + st.sdB + 0.04);
+  if (!keep) return all.sep / (all.sdA + all.sdB + eps);
+  return st.sep / (st.sdA + st.sdB + eps);
 }
 
 /** Mean/spread of the two alternating cell classes, over the kept cells. */
-function classStats(norm, keep) {
+function classStats(norm, keep, vis) {
   let sa = 0, sb = 0, qa = 0, qb = 0, na = 0, nb = 0;
   for (let i = 0; i < 64; i++) {
     if (keep && !keep[i]) continue;
+    if (vis && !vis[i]) continue;
     const v = norm[i];
     if (((i % 8) + (i >> 3)) & 1) { sb += v; qb += v * v; nb++; }
     else { sa += v; qa += v * v; na++; }
   }
   const mA = na ? sa / na : 0, mB = nb ? sb / nb : 0;
-  const sdA = Math.sqrt(Math.max(0, qa / na - mA * mA));
-  const sdB = Math.sqrt(Math.max(0, qb / nb - mB * mB));
+  const sdA = na ? Math.sqrt(Math.max(0, qa / na - mA * mA)) : 0;
+  const sdB = nb ? Math.sqrt(Math.max(0, qb / nb - mB * mB)) : 0;
   return { mA, mB, sdA, sdB, sep: Math.abs(mA - mB), na, nb };
 }
 
@@ -621,6 +697,25 @@ const DECISIVE_TRIM = 4.3;
 const HIDDEN = 1.6;
 /** Above this a candidate is worth the score-guided fit. */
 const PLAUSIBLE = 1.1;
+/**
+ * Lines kept per pyramid level. Generous on purpose: a short edge of a board at
+ * the far side of the room splits into a fan of peaks, and the board's four
+ * sides must not be crowded out of the list by the room's longer ones.
+ */
+const MAX_LINES = 56;
+
+/** Is this candidate a board? */
+function acceptScore(sc) {
+  if (sc.score > 2.5 || sc.trim() > 3.5) return true;
+  // A board across the room has squares only a few pixels across, and every
+  // sample then carries a little of the neighbouring square, so the same board
+  // scores lower the smaller it is. Measured on the synthetic scenes: a board at
+  // a quarter of the short side scores 3.5 and a quad 5 % off it 0.7–1.5, so a
+  // lower bar for small cells still leaves a wide margin. Below ~5 px per square
+  // the squares have blurred together and nothing can be read from them anyway.
+  if (sc.cell >= 5 && sc.cell < 20 && (sc.score > 1.9 || sc.trim() > 2.6)) return true;
+  return false;
+}
 
 /**
  * Find the most chessboard-looking quad.
@@ -649,16 +744,26 @@ export function detectQuad(prepared, w, h) {
     [prepared.mag, w, h],
   ];
   let best = null;
-  const tried = [];
+  const lists = [];
 
   const done = (r) => ({
     quad: r.quad, score: r.sc.score, sep: r.sc.sep, trimmed: r.sc.trim(),
   });
 
+  const score = (quad) => {
+    const r = refineCandidate(prepared, w, h, quad);
+    if (r && (!best || r.sc.score > best.sc.score)) best = r;
+  };
+
   for (const [mag, mw, mh] of levels) {
     const sx = w / mw, sy = h / mh;
-    const list = quadsFromLines(mag, mw, mh, 40);
-    const maxCands = best && best.sc.score > 0.8 ? 4 : 3;
+    const list = quadsFromLines(mag, mw, mh, MAX_LINES);
+    lists.push({ list, sx, sy });
+    const maxCands = best && best.sc.score > 0.8 ? 5 : 4;
+    // The same board shows up at every level, a little more accurately each
+    // time, so duplicates are only dropped *within* a level: a coarse attempt
+    // must not stop the finer one from being scored.
+    const tried = [];
     let used = 0;
     for (const c of list) {
       if (used >= maxCands) break;
@@ -666,8 +771,15 @@ export function detectQuad(prepared, w, h) {
       if (tried.some((t) => quadDist(t, quad) < w * 0.02)) continue;
       tried.push(quad);
       used++;
-      const r = refineCandidate(prepared, w, h, quad);
-      if (r && (!best || r.sc.score > best.sc.score)) best = r;
+      score(quad);
+      // A coarse Hough quad is a few pixels out, and a ridge snap cannot fix a
+      // *scale* error — only the score-guided fit can. Running it here, on the
+      // best candidate of the coarsest level, is what usually lets the search
+      // stop at 1/4 scale instead of paying for the half and full transforms.
+      if (best && used === 1 && best.sc.score > PLAUSIBLE && best.sc.score < DECISIVE) {
+        const fitted = fitCandidate(prepared, w, h, best.quad);
+        if (fitted && fitted.sc.score > best.sc.score) best = fitted;
+      }
       if (best && best.sc.score >= DECISIVE) return done(best);
       // partially covered board: only now is the trimmed pass worth its cost
       if (best && best.sc.score > HIDDEN && best.sc.trim() >= DECISIVE_TRIM) return done(best);
@@ -684,10 +796,31 @@ export function detectQuad(prepared, w, h) {
     if (best.sc.score > HIDDEN && best.sc.trim() >= DECISIVE_TRIM) return done(best);
   }
 
+  const close = best && best.sc.sep >= 0.18 && acceptScore(best.sc);
+  if (!close) {
+    // About to report "no board": before giving up, spend the time that a
+    // failed search is going to waste anyway on the rest of the candidate list.
+    // The first few candidates are ranked by size and shape, and the one run
+    // that matters is the one where the board was pushed down that list.
+    for (const { list, sx, sy } of lists) {
+      for (const c of list.slice(0, 24)) {
+        const quad = c.quad.map(([x, y]) => [x * sx, y * sy]);
+        score(quad);
+        if (best && best.sc.score >= DECISIVE) return done(best);
+      }
+      if (best && best.sc.score < DECISIVE && best.sc.score > PLAUSIBLE) {
+        const fitted = fitCandidate(prepared, w, h, best.quad);
+        if (fitted && fitted.sc.score > best.sc.score) best = fitted;
+      }
+      if (best && best.sc.score >= DECISIVE) return done(best);
+      if (best && best.sc.score > HIDDEN && best.sc.trim() >= DECISIVE_TRIM) return done(best);
+    }
+  }
+
   if (!best) return null;
   const sc = best.sc;
   if (sc.sep < 0.18) return null;
-  if (!(sc.score > 2.5 || sc.trim() > 3.5)) return null;
+  if (!acceptScore(sc)) return null;
   return done(best);
 }
 
@@ -731,7 +864,7 @@ function dominantDirections(lines) {
  * Candidate quads in the coordinate space of `mag`, which may be a pyramid
  * level. Returns quads sorted by board-likeness, largest first.
  */
-function quadsFromLines(mag, mw, mh, maxLines) {
+export function quadsFromLines(mag, mw, mh, maxLines, maxPairs = 120) {
   const lines = houghLines(mag, mw, mh, maxLines);
   if (lines.length < 4) return [];
 
@@ -744,17 +877,26 @@ function quadsFromLines(mag, mw, mh, maxLines) {
   }
   if (famA.length < 2 || famB.length < 2) return [];
 
-  // A board side spans several cells, so opposite lines must be far apart.
-  // Dropping near-coincident pairs removes most of the 40-choose-2 combinations
-  // (the grid lines of a small board are only ~1 cell apart) before any work.
-  const minSep = Math.min(mw, mh) * 0.22;
+  // Two lines are only worth pairing if there is room for cells between them.
+  // This floor must stay small: the board itself can be a small part of the
+  // frame, and its four sides are then only a fraction of the frame apart. It
+  // exists to avoid enumerating near-duplicate lines, nothing more.
+  const minSep = Math.max(6, Math.min(mw, mh) * 0.03);
   const pairsOf = (fam) => {
     const out = [];
     for (let i = 0; i < fam.length; i++) {
       for (let j = i + 1; j < fam.length; j++) {
         if (Math.abs(fam[i].rho - fam[j].rho) < minSep) continue;
-        out.push([i, j]);
+        out.push([i, j, Math.abs(fam[i].rho - fam[j].rho)]);
       }
+    }
+    // A board's two sides are the widest pair in its family (everything between
+    // them is grid lines), so keeping the widest pairs keeps the board while
+    // bounding the enumeration: a frame of clutter can produce hundreds of
+    // lines, and pairing all of them is what used to cost tens of milliseconds.
+    if (out.length > maxPairs) {
+      out.sort((a, b) => b[2] - a[2]);
+      out.length = maxPairs;
     }
     return out;
   };
@@ -765,19 +907,54 @@ function quadsFromLines(mag, mw, mh, maxLines) {
   const X = famA.map((a) => famB.map((b) => intersectLines(a, b)));
 
   const cands = [];
+  // Enumeration is quadratic in the number of lines and the floor above is
+  // deliberately small, so the list is capped: keep the best few dozen shapes
+  // and drop the rest as they are produced, rather than allocating tens of
+  // thousands of quads in a cluttered frame.
+  const MAXC = 48;
+  let floorRank = 0;
   for (const [a, b] of pA) {
-    for (const [c, d] of pB) {
-      const p0 = X[a][c], p1 = X[a][d], p2 = X[b][d], p3 = X[b][c];
+    for (const [c, d] of pB) {      const p0 = X[a][c], p1 = X[a][d], p2 = X[b][d], p3 = X[b][c];
       if (!p0 || !p1 || !p2 || !p3) continue;
+      // shoelace over the crossing order: exact quad area, and the cheapest way
+      // to reject the overwhelming majority of pairs
+      const ar = Math.abs(
+        p0[0] * p1[1] - p1[0] * p0[1] + p1[0] * p2[1] - p2[0] * p1[1]
+        + p2[0] * p3[1] - p3[0] * p2[1] + p3[0] * p0[1] - p0[0] * p3[1],
+      ) / 2;
+      if (ar < mw * mh * 0.004) continue;
+      if (cands.length >= MAXC && ar <= floorRank) continue;
       const q = orderByAngle([p0, p1, p2, p3]);
       if (!validQuad(q, mw, mh)) continue;
       const rank = quadRank(q);
       if (!rank) continue;
-      cands.push({ quad: q, area: rank });
+      if (cands.length < MAXC) {
+        cands.push({ quad: q, area: rank });
+        if (cands.length === MAXC) {
+          cands.sort((x, y) => y.area - x.area);
+          floorRank = cands[MAXC - 1].area;
+        }
+      } else if (rank > floorRank) {
+        cands[MAXC - 1] = { quad: q, area: rank };
+        cands.sort((x, y) => y.area - x.area);
+        floorRank = cands[MAXC - 1].area;
+      }
     }
   }
   cands.sort((x, y) => y.area - x.area);
-  return cands;
+  // A board can be a small part of the frame, and the biggest quads in a room
+  // (a table, a doorway, the frame of a window) would otherwise fill every
+  // slot of the list. Interleave the biggest with the best of the rest, so the
+  // handful of candidates the caller tries always covers both size classes.
+  const bigArea = mw * mh * 0.02;
+  const big = [], small = [];
+  for (const c of cands) (c.area >= bigArea ? big : small).push(c);
+  const out = [];
+  for (let i = 0; i < Math.max(big.length, small.length); i++) {
+    if (big[i]) out.push(big[i]);
+    if (small[i]) out.push(small[i]);
+  }
+  return out;
 }
 
 /**
@@ -802,9 +979,9 @@ export function candidateQuads(prepared, w, h) {
   };
   // coarse first: at 1/4 scale the inner grid has averaged away and the rim is
   // the strongest structure in the image
-  push(quadsFromLines(prepared.mag4, prepared.sw4, prepared.sh4, 40), w / prepared.sw4, h / prepared.sh4);
-  push(quadsFromLines(prepared.mag2, prepared.sw, prepared.sh, 40), w / prepared.sw, h / prepared.sh);
-  if (!out.length) push(quadsFromLines(prepared.mag, w, h, 40), 1, 1);
+  push(quadsFromLines(prepared.mag4, prepared.sw4, prepared.sh4, MAX_LINES), w / prepared.sw4, h / prepared.sh4);
+  push(quadsFromLines(prepared.mag2, prepared.sw, prepared.sh, MAX_LINES), w / prepared.sw, h / prepared.sh);
+  if (!out.length) push(quadsFromLines(prepared.mag, w, h, MAX_LINES), 1, 1);
   out.sort((a, b) => b.area - a.area);
   return out;
 }
@@ -1184,6 +1361,72 @@ export function median(arr) {
   return a[a.length >> 1];
 }
 
+/**
+ * The grid the square descriptors are sampled on.
+ *
+ * Two frames can only be compared when their descriptors were sampled on the
+ * *same* grid. The tracker re-fits the quad on every moving frame, and a shift
+ * of even half a pixel re-samples different pixels; on the far side of the
+ * board, where the squares are small, that alone lifts a dozen squares over the
+ * change threshold — indistinguishable from a hand lying on the board, and it
+ * never clears. So the grid is anchored to the last confirmed position and only
+ * moved when the tracker says it really moved, which is also exactly when the
+ * move reader starts again from a fresh reference.
+ */
+export class BoardSampler {
+  constructor() {
+    this.H = null;
+    this.quad = null;
+    this.cell = 0;
+  }
+
+  /** Descriptor of this frame, on the anchored grid. */
+  see(prepared, w, h, res) {
+    if (!this.H || !res.H || res.gridMoved) this.anchor(res);
+    return describeBoard(prepared, w, h, this.H);
+  }
+
+  /**
+   * How far the tracked board has slid away from the anchored grid, in
+   * squares. Up to a fraction of a cell this only moves the sample points
+   * slightly inside their squares; the comparison stays valid because both
+   * frames use the same grid.
+   */
+  drift(res) {
+    if (!this.quad || !res.quad || !this.cell) return Infinity;
+    let s = 0;
+    for (let i = 0; i < 4; i++) {
+      s += Math.hypot(res.quad[i][0] - this.quad[i][0], res.quad[i][1] - this.quad[i][1]);
+    }
+    return s / 4 / this.cell;
+  }
+
+  /**
+   * Move the grid onto the current position and describe the frame there.
+   * Only safe when nothing is pending: it re-samples different pixels, so the
+   * caller must take the result as the new reference.
+   */
+  refresh(prepared, w, h, res) {
+    this.anchor(res);
+    return describeBoard(prepared, w, h, this.H);
+  }
+
+  anchor(res) {
+    this.H = res.H;
+    const q = res.quad;
+    this.quad = q ? q.map(([x, y]) => [x, y]) : null;
+    this.cell = q ? Math.min(
+      Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]),
+      Math.hypot(q[2][0] - q[1][0], q[2][1] - q[1][1]),
+    ) / 8 : 0;
+  }
+
+  reset() {
+    this.H = this.quad = null;
+    this.cell = 0;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* tracker                                                             */
 /* ------------------------------------------------------------------ */
@@ -1290,12 +1533,14 @@ export class BoardTracker {
       this.quadShift = 0;
       this.motion = motion;
       this.still = true;
+      this.gridMoved = false;
       // nothing is moving, so nothing will be moving next frame either: a
       // stale velocity would throw the next prediction off
       this.vel = null;
       return {
         quad: this.quad, H: this.H, score: this.score, scoreTrim: this.scoreTrim,
-        quadShift: 0, redetected: false, motion, prepared: this.lastPrepared, still: true,
+        quadShift: 0, gridMoved: false, cell: this.cell || 0,
+        redetected: false, motion, prepared: this.lastPrepared, still: true,
       };
     }
     this.still = false;
@@ -1372,10 +1617,22 @@ export class BoardTracker {
     // how far the sampling grid moved this frame: callers must not compare
     // square descriptors across a grid change
     this.quadShift = quadBefore && this.quad ? meanCornerShift(quadBefore, this.quad) : 0;
+    // ...but a fraction of a pixel is not a grid change: the per-frame refit
+    // moves the quad a little every time the camera does, and throwing away the
+    // pending change set for that is how a move played under a hand used to get
+    // lost. Only a shift big enough to re-sample different pixels counts, and
+    // "big enough" scales with the square size.
+    const cell = this.quad ? Math.min(
+      Math.hypot(this.quad[1][0] - this.quad[0][0], this.quad[1][1] - this.quad[0][1]),
+      Math.hypot(this.quad[2][0] - this.quad[1][0], this.quad[2][1] - this.quad[1][1]),
+    ) / 8 : 0;
+    this.cell = cell;
+    this.gridMoved = this.quadShift > Math.max(1, cell * 0.2);
     this.motion = motion;
     return {
       quad: this.quad, H: this.H, score: this.score, scoreTrim: this.scoreTrim,
-      quadShift: this.quadShift, redetected: this.redetected, motion, prepared, still: false,
+      quadShift: this.quadShift, gridMoved: this.gridMoved, cell,
+      redetected: this.redetected, motion, prepared, still: false,
     };
   }
 }

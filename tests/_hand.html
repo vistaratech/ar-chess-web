@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>move under hand debug</title>
+<style>
+  body { background: #111; color: #ddd; font: 12px/1.45 ui-monospace, monospace; margin: 0; padding: 16px; }
+  canvas { display: block; border: 1px solid #444; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="270"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+const b = '?v=' + Date.now();
+const V = await import('../js/vision.js' + b);
+const T = await import('../js/track.js' + b);
+const { Chess } = await import('../vendor/chess.js' + b);
+const { renderScene, makePose } = await import('./scene.js' + b);
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 480), H = +(qp.get('h') || 270);
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const frame = () => ctx.getImageData(0, 0, W, H).data;
+const HAND = { pts: [[-0.4, 5.6], [1.6, 6.2], [2.2, 7.4]], width: 2.4 };
+
+const quad = makePose(W, H, { tilt: 0.24, size: Math.min(W, H) * 0.8 });
+const game = new Chess();
+const tr = new V.BoardTracker({ side: 'w' });
+const reader = new T.MoveReader();
+const shot = (fen, occ) => renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: 9, seed: 31, occluders: occ });
+const sq = (i) => 'abcdefgh'[i & 7] + ((i >> 3) + 1);
+
+shot(game.fen(), null);
+let res = tr.update(frame(), W, H);
+const d0 = V.describeBoard(res.prepared, W, H, res.H);
+reader.commit(d0);
+const legalBefore = game.moves({ verbose: true });
+const want = game.move('Nf3');
+log(`baseline: H=${!!res.H} score=${res.score.toFixed(1)} trim=${res.scoreTrim.toFixed(1)} quadErr=` +
+  (Math.hypot(res.quad[0][0] - quad[0][0], res.quad[0][1] - quad[0][1])).toFixed(1) + 'px');
+
+const run = (n, occ, tag) => {
+  for (let i = 0; i < n; i++) {
+    shot(game.fen(), occ);
+    const r = tr.update(frame(), W, H);
+    if (!r.H) { log(`${tag} ${i}: no lock`); continue; }
+    const desc = V.describeBoard(r.prepared, W, H, r.H);
+    const p = reader.push(desc, { gridMoved: r.gridMoved });
+    const diff = V.squareDiff(d0, desc);
+    let mx = 0, over = 0;
+    for (let s = 0; s < 64; s++) { mx = Math.max(mx, diff[s]); if (diff[s] > 12) over++; }
+    const g1 = 6, f3 = 21;
+    const px = (s) => {
+      const c = V.cellCenter(r.H, s & 7, s >> 3);
+      const g = r.prepared.gray;
+      return g && c ? (g[Math.round(c[1]) * W + Math.round(c[0])] || 0).toFixed(0) : '?';
+    };
+    log(`${tag} ${i}: ${game.fen().split(' ')[0]} still=${r.still} grid=${r.gridMoved} shift=${r.quadShift.toFixed(2)} max=${mx.toFixed(0)} over=${over} ` +
+      `g1=${diff[g1].toFixed(0)} f3=${diff[f3].toFixed(0)} px=${px(g1)}/${px(f3)} ` +
+      `changed=${[...(p.changed || [])].map(sq).join(',')} settled=${!!p.settled} impl=${!!p.implausible} stuck=${!!p.stuck} reb=${!!p.rebased}`);
+  }
+};
+run(3, [HAND], 'hand1');
+run(4, [HAND], 'hand2');
+run(6, null, 'clear');
+const inf = T.inferMove(legalBefore, []);
+log(`want ${want.from}${want.to}`);
+window.__done = true;
+</script>
+</body>
+</html>

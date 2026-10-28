@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>detection stage timing</title>
+<style>
+  body { background: #111; color: #ddd; font: 12px/1.45 ui-monospace, monospace; margin: 0; padding: 16px; }
+  canvas { display: block; border: 1px solid #444; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="270"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+const b = '?v=' + Date.now();
+const V = await import('../js/vision.js' + b);
+const { renderScene, makePose } = await import('./scene.js' + b);
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 480), H = +(qp.get('h') || 270);
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+const time = (fn) => { const t0 = performance.now(); const r = fn(); return [performance.now() - t0, r]; };
+const bench = (fn, reps = 5) => {
+  let best = Infinity, last;
+  for (let i = 0; i < reps; i++) { const [t, r] = time(fn); if (t < best) best = t; last = r; }
+  return [best, last];
+};
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const pose = {
+  cx: W * +(qp.get('cx') ?? 0.5),
+  cy: H * +(qp.get('cy') ?? 0.5),
+  size: Math.min(W, H) * +(qp.get('size') ?? 0.8),
+  rot: +(qp.get('rot') ?? 0),
+  tilt: +(qp.get('tilt') ?? 0.3),
+  skew: +(qp.get('skew') ?? 0),
+};
+const clutter = +(qp.get('clutter') ?? 0);
+const noise = +(qp.get('noise') ?? 10);
+const light = +(qp.get('light') ?? 0.05);
+const border = +(qp.get('border') ?? 0.02);
+const quad = makePose(W, H, pose);
+renderScene(ctx, { w: W, h: H, fen: START, quad, border, light, noise, clutter, seed: 3 });
+log(`pose ${JSON.stringify(pose)} clutter=${clutter} noise=${noise} light=${light}`);
+
+const rgba = ctx.getImageData(0, 0, W, H).data;
+const prep = V.prepareFrame(rgba, W, H);
+// what the Hough threshold ends up as, and how many pixels it keeps
+const histCount = (mag) => {
+  const hist = new Uint32Array(256);
+  let total = 0;
+  for (let i = 0; i < mag.length; i++) {
+    const v = mag[i] | 0;
+    if (v > 0) { hist[v > 255 ? 255 : v]++; total++; }
+  }
+  let acc = 0, p93 = 255;
+  const target = total * 0.93;
+  for (let i = 0; i < hist.length; i++) { acc += hist[i]; if (acc >= target) { p93 = i; break; } }
+  const thr = Math.max(20, p93);
+  let n = 0;
+  for (let i = 0; i < mag.length; i++) if (mag[i] >= thr) n++;
+  return `nonzero=${total} p93=${p93} thr=${thr} kept=${n}`;
+};
+for (const [name, mag, mw, mh] of [['mag4', prep.mag4, prep.sw4, prep.sh4], ['mag2', prep.mag2, prep.sw, prep.sh], ['mag1', prep.mag, W, H]]) {
+  log(`${name} ${mw}x${mh}: ${histCount(mag)}`);
+  const [th, ls] = bench(() => V.houghLines(mag, mw, mh, 40));
+  const [tq, qs] = bench(() => V.quadsFromLines(mag, mw, mh, 40));
+  log(`${name} ${mw}x${mh}: hough ${th.toFixed(1)}ms lines=${ls.length}  quads ${tq.toFixed(1)}ms n=${qs.length}  top=${qs.slice(0, 3).map((c) => (Math.sqrt(c.area) | 0)).join(',')}`);
+}
+for (let i = 0; i < 3; i++) {
+  const [t, d] = bench(() => V.detectQuad(prep, W, H));
+  log(`detectQuad ${t.toFixed(1)}ms -> ${d ? `score=${d.score.toFixed(1)} trim=${d.trimmed.toFixed(1)}` : 'null'}`);
+}
+// what each pyramid level offers, in full-res coordinates
+for (const [name, mag, mw, mh] of [['mag4', prep.mag4, prep.sw4, prep.sh4], ['mag2', prep.mag2, prep.sw, prep.sh], ['mag1', prep.mag, W, H]]) {
+  const sx = W / mw, sy = H / mh;
+  const qs = V.quadsFromLines(mag, mw, mh, 40);
+  const rows = [];
+  for (const c of qs.slice(0, 5)) {
+    const q = c.quad.map(([x, y]) => [x * sx, y * sy]);
+    const raw = V.scoreQuad(prep, W, H, q);
+    const fit = V.refineQuad(prep, W, H, q, { inset: true, passes: 3 });
+    const fs = fit ? V.scoreQuad(prep, W, H, fit) : null;
+    rows.push(`${raw ? raw.score.toFixed(2) : '-'}/${fs ? fs.score.toFixed(2) : '-'}`);
+  }
+  log(`${name}: raw/fitted ${rows.join(' ')}`);
+}
+const tr = new V.BoardTracker({ side: 'w' });
+const [tt, res] = time(() => tr.update(rgba, W, H));
+log(`tracker.update ${tt.toFixed(1)}ms -> ${res.quad ? `score=${res.score.toFixed(1)}` : 'null'}`);
+window.__done = true;
+</script>
+</body>
+</html>
