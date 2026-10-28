@@ -79,6 +79,7 @@ export class MoveReader {
     this.fired = false;
     this.noise = 3;
     this.changed = new Set();
+    this.implausibleSince = 0;
   }
 
   /** Accept the current descriptor as the new confirmed position. */
@@ -88,9 +89,10 @@ export class MoveReader {
     this.calm = 0;
     this.fired = false;
     this.changed = new Set();
+    this.implausibleSince = 0;
   }
 
-  push(desc, { gridMoved = false } = {}) {
+  push(desc, { gridMoved = false, now = 0 } = {}) {
     if (!this.base || gridMoved) {
       // A different sampling grid makes every square incomparable, so take the
       // frame as the new reference instead of reporting a board-wide change.
@@ -98,7 +100,8 @@ export class MoveReader {
       this.calm = 0;
       this.fired = false;
       this.changed = new Set();
-      return { changed: new Set(), settled: false, motion: 0, noise: this.noise, threshold: 0, rebased: true };
+      this.implausibleSince = 0;
+      return { changed: new Set(), settled: false, stuck: false, implausible: false, motion: 0, noise: this.noise, threshold: 0, rebased: true };
     }
 
     const instant = squareDiff(desc, this.prev);
@@ -111,15 +114,38 @@ export class MoveReader {
     // Track the noise floor only while the board is still.
     if (motion < this.noise * 1.8) this.noise += (Math.max(2.5, motion) - this.noise) * 0.06;
 
-    const threshold = Math.max(13, this.noise * 3);
+    // Threshold: well above the frame-to-frame noise, but low enough for the
+    // weakest real change (a pawn arriving on a square of its own colour).
+    const threshold = Math.max(11, this.noise * 2.6);
     const vsBase = squareDiff(desc, this.base);
     const changed = new Set();
     for (let i = 0; i < 64; i++) if (vsBase[i] > threshold) changed.add(i);
     this.changed = changed;
 
+    // A legal move changes at most four squares (castling). A much larger set is
+    // a hand, an arm or the board being picked up, not a move — hold the frame
+    // as it is instead of accepting it as the new reference. That is what lets a
+    // move played *under* a resting hand still be read once the board is clear.
+    const implausible = changed.size > 6;
+
     // fire once per settling: after two still frames with something changed
-    const settled = this.calm >= 2 && changed.size > 0 && !this.fired;
+    const settled = this.calm >= 2 && changed.size > 0 && !this.fired && !implausible;
     if (settled) this.fired = true;
-    return { changed, settled, motion, noise: this.noise, threshold };
+
+    // ...but do not wait forever: a genuinely different position (a new game, a
+    // board swapped out) has to be accepted eventually. Eight seconds of a
+    // *completely still* implausible change set is far longer than any move
+    // played under a hand, and short enough that the app cannot be stuck showing
+    // "waiting" for a board it will never understand.
+    if (implausible) {
+      if (!this.implausibleSince) this.implausibleSince = now || 1;
+    } else {
+      this.implausibleSince = 0;
+    }
+    const waited = now && this.implausibleSince ? now - this.implausibleSince : this.calm * 33;
+    const stuck = implausible && waited > 8000 && !this.fired;
+    if (stuck) this.fired = true;
+
+    return { changed, settled, stuck, implausible, motion, noise: this.noise, threshold };
   }
 }

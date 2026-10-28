@@ -29,7 +29,9 @@ export function makePose(w, h, opts = {}) {
 }
 
 /** Draw a FEN position into a perspective quad. */
-export function renderScene(ctx, { w, h, fen, quad, border = 0.03, light = 0, noise = 0, clutter = 0, seed = 1 }) {
+export function renderScene(ctx, {
+  w, h, fen, quad, border = 0.03, light = 0, noise = 0, clutter = 0, seed = 1, occluders = null,
+}) {
   let s = seed >>> 0;
   const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
 
@@ -76,6 +78,37 @@ export function renderScene(ctx, { w, h, fen, quad, border = 0.03, light = 0, no
         drawPiece(ctx, c[0], c[1], size * 0.82, ch);
         file++;
       }
+    }
+  }
+
+  // an arm / hand lying over the board: a thick rounded stroke in *board*
+  // coordinates, so it follows the board through any pose. This is the thing
+  // that breaks naive edge detection (it hides part of a side) and naive move
+  // reading (it changes a dozen squares at once).
+  if (occluders && occluders.length) {
+    const a0 = project(H, 0.5, 0.5), a1 = project(H, 1.5, 0.5);
+    const cell = Math.hypot(a1[0] - a0[0], a1[1] - a0[1]);
+    for (const o of occluders) {
+      const pts = o.pts.map(([f, r]) => project(H, f, r));
+      if (pts.some((p) => !p)) continue;
+      const path = () => {
+        ctx.beginPath();
+        pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      };
+      ctx.save();
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      // shadowed edge first, body on top: a flat blob would be too easy
+      ctx.strokeStyle = 'rgba(48, 28, 20, .55)';
+      ctx.lineWidth = (o.width || 1.6) * cell * 1.12;
+      path(); ctx.stroke();
+      ctx.strokeStyle = o.color || '#c2815c';
+      ctx.lineWidth = (o.width || 1.6) * cell;
+      path(); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255, 226, 200, .28)';
+      ctx.lineWidth = Math.max(1, cell * 0.18);
+      path(); ctx.stroke();
+      ctx.restore();
     }
   }
 

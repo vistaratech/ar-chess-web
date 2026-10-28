@@ -175,9 +175,190 @@ for (const san of moves) {
   log(`${san.padEnd(6)} want=${want.from}${want.to} got=${got ? got.from + got.to : '---'} ${okMove ? 'ok' : 'FAIL ' + (note || trace.join(' '))}`);
 }
 log(`move reading: ${pass}/${moves.length}`);
+
+/* ------------------------------------------------------------------ */
+/* 4. a person's arm lying across the board                            */
+/* ------------------------------------------------------------------ */
+log('\n=== 4. occlusion (arm across the board) ===');
+
+const ARM = { pts: [[-0.5, 0.6], [2.4, 1.5], [5.4, 2.2], [8.4, 2.6]], width: 2.1 };
+const HAND = { pts: [[-0.6, 5.2], [1.8, 6.4], [2.6, 7.6]], width: 2.4 };
+
+// 4a. detection with a hand/forearm entering over one corner
+{
+  let hit = 0;
+  for (let i = 0; i < 6; i++) {
+    const p = poses[i];
+    const quad = makePose(W, H, p);
+    renderScene(ctx, {
+      w: W, h: H, fen: START, quad, border: p.border || 0, light: p.light,
+      noise: p.noise, clutter: p.clutter, seed: i + 1, occluders: [HAND],
+    });
+    const tr = new BoardTracker({ side: 'w' });
+    const res = tr.update(frame(), W, H);
+    const bw = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+    const rel = quadError(res.quad, quad) / bw;
+    if (res.quad && rel < 0.06) hit++;
+    log(`  pose ${i}: err=${isFinite(rel) ? (rel * 100).toFixed(1) + '%' : 'none'} score=${res.score.toFixed(1)}/trim=${res.scoreTrim.toFixed(1)} ${res.quad && rel < 0.06 ? 'ok' : 'FAIL'}`);
+  }
+  log(`  detection with a corner occluded: ${hit}/6`);
+}
+
+// 4b. an arm lies across the board *while* the camera pans: the lock must
+// survive and the grid must keep following the board (this is the "somebody is
+// playing" case — the overlay may not jump or reset)
+{
+  const q0 = makePose(W, H, { tilt: 0.3, size: Math.min(W, H) * 0.8 });
+  const tr = new BoardTracker({ side: 'w' });
+  renderScene(ctx, { w: W, h: H, fen: START, quad: q0, border: 0.02, light: 0.04, noise: 8, seed: 20 });
+  tr.update(frame(), W, H);
+  let worst = 0, lost = 0, shifted = 0;
+  for (let k = 1; k <= 18; k++) {
+    const q = q0.map(([x, y]) => [x + k * 2.2, y + k * 0.5]);
+    renderScene(ctx, {
+      w: W, h: H, fen: START, quad: q, border: 0.02, light: 0.04,
+      noise: 8, seed: 20 + (k % 3), occluders: [ARM],
+    });
+    const res = tr.update(frame(), W, H);
+    if (!res.quad) { lost++; continue; }
+    if (res.quadShift > 0.25) shifted++;
+    const bw = Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]);
+    const rel = quadError(res.quad, q) / bw;
+    worst = Math.max(worst, rel);
+  }
+  log(`  pan+arm: lost=${lost}/18 followed=${shifted}/18 worst=${(worst * 100).toFixed(1)}%`
+    + `${!lost && worst < 0.06 ? ' ok' : ' FAIL'}`);
+}
+
+// 4c. a hand over a corner while a move is played elsewhere: the move must be
+// read as soon as the hand is gone (the reference must not be thrown away)
+{
+  const quad = makePose(W, H, { tilt: 0.24, size: Math.min(W, H) * 0.8 });
+  const HAND = { pts: [[-0.4, 5.6], [1.6, 6.2], [2.2, 7.4]], width: 2.4 };
+  const game = new Chess();
+  const tr = new BoardTracker({ side: 'w' });
+  const reader = new MoveReader();
+  const shot = (fen, occ) => {
+    renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: 9, seed: 31, occluders: occ });
+  };
+  const readFrames = (n, occ) => {
+    let last = null;
+    for (let i = 0; i < n; i++) {
+      shot(game.fen(), occ);
+      const res = tr.update(frame(), W, H);
+      if (!res.H) return null;
+      const desc = describeBoard(res.prepared, W, H, res.H);
+      last = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
+      if (last.settled || last.stuck) return { r: last, desc, res };
+    }
+    return { r: last, desc: null, res: null };
+  };
+
+  shot(game.fen(), null);
+  let res = tr.update(frame(), W, H);
+  reader.commit(describeBoard(res.prepared, W, H, res.H));
+  const legalBefore = game.moves({ verbose: true });
+  const want = game.move('Nf3');
+  // hand parks on the board first, then the knight moves underneath it
+  const a = readFrames(3, [HAND]);
+  const b = readFrames(4, [HAND]);
+  const c = readFrames(4, null);
+  const inf = c && c.r && c.r.settled ? inferMove(legalBefore, c.r.changed) : { accepted: false };
+  const okM = inf.accepted && inf.move.from === want.from && inf.move.to === want.to;
+  log(`  move under a hand: parked=${!!(a && a.r && a.r.implausible)} fired-while-covered=${!!(b && b.r && b.r.settled)} read=${okM ? 'ok' : 'FAIL'}`
+    + (okM ? '' : ` changed=${c && c.r ? [...c.r.changed].map(indexSquare).join(',') : '-'}`));
+}
+
+// 4d. the same, but the hand covers the squares the piece moves through
+{
+  const quad = makePose(W, H, { tilt: 0.24, size: Math.min(W, H) * 0.8 });
+  const HAND = { pts: [[4.2, 0.9], [6.4, 1.3], [7.2, 2.1]], width: 2.6 };
+  const game = new Chess();
+  const tr = new BoardTracker({ side: 'w' });
+  const reader = new MoveReader();
+  const shot = (fen, occ) => {
+    renderScene(ctx, { w: W, h: H, fen, quad, border: 0.02, light: 0.04, noise: 9, seed: 41, occluders: occ });
+  };
+  const step = (n, occ) => {
+    let last = null;
+    for (let i = 0; i < n; i++) {
+      shot(game.fen(), occ);
+      const res = tr.update(frame(), W, H);
+      if (!res.H) return null;
+      const desc = describeBoard(res.prepared, W, H, res.H);
+      last = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
+      if (last.settled || last.stuck) return { r: last, desc };
+    }
+    return { r: last, desc: null };
+  };
+  shot(game.fen(), null);
+  const r0 = tr.update(frame(), W, H);
+  reader.commit(describeBoard(r0.prepared, W, H, r0.H));
+  const legalBefore = game.moves({ verbose: true });
+  const want = game.move('Nf3');
+  step(3, [HAND]);
+  const c = step(5, null);
+  const inf = c && c.r && c.r.settled ? inferMove(legalBefore, c.r.changed) : { accepted: false };
+  const okM = inf.accepted && inf.move.from === want.from && inf.move.to === want.to;
+  log('  move out of a hand: read=' + (okM ? 'ok' : 'FAIL')
+    + (okM ? '' : ` changed=${c && c.r ? [...c.r.changed].map(indexSquare).join(',') : '-'}`));
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. false locks: no board in the frame                               */
+/* ------------------------------------------------------------------ */
+log('\n=== 5. no board present ===');
+let falseLocks = 0;
+{
+  // A table, a wall, a poster with rectangles, a heap of clutter: the app must
+  // not claim a board here. A false lock is worse than no lock — every square
+  // would report nonsense moves.
+  let seed = 5;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const scenes = [
+    (c) => {
+      c.fillStyle = '#8a6f52'; c.fillRect(0, 0, W, H);
+      for (let i = 0; i < 40; i++) {
+        c.fillStyle = `rgba(${60 + rnd() * 90 | 0},${40 + rnd() * 70 | 0},${30 + rnd() * 60 | 0},.5)`;
+        c.fillRect(rnd() * W, rnd() * H, 10 + rnd() * 120, 4 + rnd() * 30);
+      }
+    },
+    (c) => {
+      c.fillStyle = '#cfcabf'; c.fillRect(0, 0, W, H);
+      c.strokeStyle = '#5d5a54'; c.lineWidth = 3;
+      for (let i = 0; i < 6; i++) {
+        const w = 40 + rnd() * 160, h = 30 + rnd() * 90;
+        c.strokeRect(rnd() * (W - w), rnd() * (H - h), w, h);
+      }
+    },
+    (c) => {
+      c.fillStyle = '#2b2f36'; c.fillRect(0, 0, W, H);
+      for (let i = 0; i < 700; i++) {
+        c.fillStyle = `rgba(${rnd() * 255 | 0},${rnd() * 255 | 0},${rnd() * 255 | 0},.35)`;
+        c.fillRect(rnd() * W, rnd() * H, 2 + rnd() * 20, 2 + rnd() * 20);
+      }
+    },
+    (c) => {
+      // a striped rug: parallel lines only, like half a board
+      c.fillStyle = '#7a5b3c'; c.fillRect(0, 0, W, H);
+      c.fillStyle = '#3d2c1c';
+      for (let i = 0; i < 9; i++) c.fillRect(0, i * 30, W, 14);
+    },
+  ];
+  let falseLocksInScene = 0;
+  scenes.forEach((draw, i) => {
+    draw(ctx);
+    const tr = new BoardTracker({ side: 'w' });
+    const res = tr.update(frame(), W, H);
+    if (res.quad) { falseLocks++; falseLocksInScene++; }
+    log(`  scene ${i}: ${res.quad ? 'LOCKED (bad)' : 'no lock'} score=${res.score.toFixed(1)} trim=${res.scoreTrim.toFixed(1)}`);
+  });
+  log(`  false locks: ${falseLocksInScene}/${scenes.length}`);
+}
+
 log('\ndone');
 window.__done = true;
-window.__summary = { detection: `${ok}/${total}`, moveRead: `${pass}/${moves.length}` };
+window.__summary = { detection: `${ok}/${total}`, moveRead: `${pass}/${moves.length}`, falseLocks };
 </script>
 </body>
 </html>

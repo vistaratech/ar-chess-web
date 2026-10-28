@@ -39,6 +39,7 @@ let frames = 0;
 let stepMs = 0;                // duration of the last processed frame
 let stepAvg = 0;               // smoothed duration, for the on-device readout
 let stillFrame = false;
+let occluded = false;          // a hand/arm is over the board right now
 let status = { text: 'Starting camera…', tone: '' };
 
 /* ------------------------------------------------------------------ */
@@ -209,10 +210,12 @@ function step(now) {
       desc = describeBoard(res.prepared, vw, vh, res.H);
       lastDesc = desc;
     }
-    const r = reader.push(desc, { gridMoved: res.quadShift > 0.25 });
-    if (r.settled) readBoard(desc, r);
+    const r = reader.push(desc, { gridMoved: res.quadShift > 0.25, now: performance.now() });
+    occluded = !!r.implausible;
+    if (r.settled || r.stuck) readBoard(desc, r);
   } else {
     lastDesc = null;
+    occluded = false;
   }
 
   updateStatus(res);
@@ -243,6 +246,16 @@ function startLoop() {
 }
 
 function readBoard(desc, r) {
+  // Too much changed to be a move: a hand, an arm, or the board being handled.
+  // Keep the confirmed position as the reference and wait — the move being
+  // played underneath the hand is read as soon as the board is clear again.
+  // (Only after the change set has been stable for several seconds does the
+  // reader insist on a re-baseline, which is what `stuck` means.)
+  if (r.implausible && !r.stuck) {
+    setStatus('Hand over the board — waiting for a clear view', '');
+    return;
+  }
+
   const inf = inferMove(game.moves({ verbose: true }), r.changed);
   if (inf.accepted) {
     game.move({ from: inf.move.from, to: inf.move.to, promotion: inf.move.promotion || 'q' });
@@ -255,9 +268,8 @@ function readBoard(desc, r) {
   // Nothing conclusive this time: take the frame as the new reference so the
   // next move is measured from here instead of piling up differences.
   reader.commit(desc);
-  const howMany = r.changed.size;
-  setStatus(howMany > 6
-    ? 'Saw too many changes — hold the camera still for a moment'
+  setStatus(r.stuck
+    ? 'Board changed a lot — tap Resync if that was not a hand'
     : 'Could not read that move — tap Resync', 'bad');
 }
 
@@ -265,6 +277,10 @@ function updateStatus(res) {
   if (performance.now() < holdStatus) return;
   if (!res.quad) {
     setStatus('Looking for a chessboard…', '');
+    return;
+  }
+  if (occluded) {
+    setStatus('Hand over the board — waiting for a clear view', '');
     return;
   }
   if (!thinking && game.turn() === tracker.side) {
@@ -446,11 +462,13 @@ start();
 window.__ar = () => ({
   locked: tracker.locked,
   score: Number(tracker.score.toFixed(2)),
+  scoreTrim: Number(tracker.scoreTrim.toFixed(2)),
   quadShift: Number((tracker.quadShift || 0).toFixed(2)),
   frames,
   ms: Number(stepMs.toFixed(2)),
   avgMs: Number(stepAvg.toFixed(2)),
   still: stillFrame,
+  occluded,
   motion: Number((tracker.motion ?? 0).toFixed(2)),
   status: status.text,
   turn: game.turn(),

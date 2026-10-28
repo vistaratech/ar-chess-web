@@ -108,6 +108,21 @@ for (const noise of [4, 8, 14]) {
     for (const f of frames2) tr.update(f, W, H);
   });
   bench('vision: one moving frame', 24, () => tr.update(frames2[Math.floor(Math.random() * 6)], W, H));
+
+  // The same frames with an arm lying over the board: tracking must keep
+  // following (that is what keeps the overlay glued while somebody plays) and
+  // must not cost more than a clear board — no extra detection passes.
+  const ARM = [{ pts: [[-0.5, 0.6], [2.4, 1.5], [5.4, 2.2], [8.4, 2.6]], width: 2.1 }];
+  const armFrames = [];
+  for (let i = 0; i < 6; i++) {
+    renderScene(ctx, { w: W, h: H, fen: fens[i % 3], quad, border: 0.02, light: 0.05, noise: 6, seed: 21 + i, occluders: ARM });
+    armFrames.push(ctx.getImageData(0, 0, W, H).data);
+  }
+  const trA = new BoardTracker({ side: 'w' });
+  trA.update(armFrames[0], W, H);
+  bench('vision: one frame, arm on board', 24, () => trA.update(armFrames[Math.floor(Math.random() * 6)], W, H));
+  const ares = trA.update(armFrames[0], W, H);
+  log(`  arm: locked=${!!ares.quad} score=${ares.score.toFixed(1)} trim=${ares.scoreTrim.toFixed(1)}`);
 }
 
 log(`\nresolution ${W}x${H}`);

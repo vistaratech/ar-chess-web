@@ -270,7 +270,7 @@ function percentileFromHistogram(hist, total, q) {
   return hist.length - 1;
 }
 
-function sampleBilinear(src, w, h, x, y) {
+export function sampleBilinear(src, w, h, x, y) {
   if (!(x >= 0 && y >= 0 && x <= w - 1 && y <= h - 1)) return null;
   const x0 = x | 0, y0 = y | 0;
   const x1 = x0 < w - 1 ? x0 + 1 : x0;
@@ -503,18 +503,72 @@ export function scoreQuad(prepared, w, h, quad) {
     }
   }
 
-  let sa = 0, sb = 0, qa = 0, qb = 0;
-  for (let i = 0; i < 64; i++) {
-    const v = norm[i];
-    if ((i % 8 + (i >> 3)) & 1) { sb += v; qb += v * v; }
-    else { sa += v; qa += v * v; }
-  }
-  const mA = sa / 32, mB = sb / 32;
-  const sdA = Math.sqrt(Math.max(0, qa / 32 - mA * mA));
-  const sdB = Math.sqrt(Math.max(0, qb / 32 - mB * mB));
-  const sep = Math.abs(mA - mB);
+  // Two readings of the same cells.
+  //
+  // `score` averages all 64 cells. That is the strict one: a quad that is even
+  // half a square out of phase loses the alternation everywhere at once, so a
+  // wrong quad cannot score, and this is what detection and ranking use.
+  //
+  // `trim()` repeats the measurement after dropping the cells that do not fit
+  // their colour class (two rounds of 1.8 sigma). A hand or an arm lying on the
+  // board makes exactly those cells — it is neither light wood nor dark wood —
+  // so the trimmed score stays high while the strict one collapses. Tracking
+  // uses it, which is what lets the grid stay glued to a board that is partly
+  // covered.
+  //
+  // The trimmed pass is lazy on purpose: detection scores dozens of candidate
+  // quads per frame and only needs the strict number to rank them.
+  const all = classStats(norm, null);
+  const score = all.sep / (all.sdA + all.sdB + 0.04);
+  let trimScore = -1;
+  return {
+    h: H, mA: all.mA, mB: all.mB, sdA: all.sdA, sdB: all.sdB, sep: all.sep, score,
+    trim() {
+      if (trimScore < 0) trimScore = trimmedScore(norm, all);
+      return trimScore;
+    },
+  };
+}
 
-  return { h: H, sep, sdA, sdB, mA, mB, score: sep / (sdA + sdB + 0.04) };
+const keepA = new Uint8Array(64);
+const keepB = new Uint8Array(64);
+
+/** Colour separation after throwing out the cells that fit neither class. */
+function trimmedScore(norm, all) {
+  let keep = null;
+  let st = all;
+  for (let round = 0; round < 2; round++) {
+    const nk = round === 0 ? keepA : keepB;
+    let n = 0;
+    for (let i = 0; i < 64; i++) {
+      const odd = ((i % 8) + (i >> 3)) & 1;
+      const m = odd ? st.mB : st.mA;
+      const sd = Math.max(odd ? st.sdB : st.sdA, 0.03);
+      const on = Math.abs(norm[i] - m) <= 1.8 * sd ? 1 : 0;
+      nk[i] = on;
+      n += on;
+    }
+    if (n < 40) break;
+    keep = nk;
+    st = classStats(norm, keep);
+  }
+  if (!keep) return all.sep / (all.sdA + all.sdB + 0.04);
+  return st.sep / (st.sdA + st.sdB + 0.04);
+}
+
+/** Mean/spread of the two alternating cell classes, over the kept cells. */
+function classStats(norm, keep) {
+  let sa = 0, sb = 0, qa = 0, qb = 0, na = 0, nb = 0;
+  for (let i = 0; i < 64; i++) {
+    if (keep && !keep[i]) continue;
+    const v = norm[i];
+    if (((i % 8) + (i >> 3)) & 1) { sb += v; qb += v * v; nb++; }
+    else { sa += v; qa += v * v; na++; }
+  }
+  const mA = na ? sa / na : 0, mB = nb ? sb / nb : 0;
+  const sdA = Math.sqrt(Math.max(0, qa / na - mA * mA));
+  const sdB = Math.sqrt(Math.max(0, qb / nb - mB * mB));
+  return { mA, mB, sdA, sdB, sep: Math.abs(mA - mB), na, nb };
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,19 +576,51 @@ export function scoreQuad(prepared, w, h, quad) {
 /* ------------------------------------------------------------------ */
 
 
-/** Snap a candidate onto the ridges, then judge it by colour consistency. */
+/**
+ * Cheap fit for a Hough candidate: the raw quad, a ridge snap and a fine snap.
+ * Returns the best of the three by colour score.
+ */
 function refineCandidate(prepared, w, h, quad) {
-  let q = snapQuad(prepared.mag, w, h, quad, 10) || quad;
-  const again = snapQuad(prepared.mag, w, h, q, 3);
-  if (again && validQuad(again, w, h)) q = again;
-  if (!validQuad(q, w, h)) return null;
+  // A plain ridge snap is not always right: a row of pieces standing near the
+  // board edge makes a stronger line just *inside* the frame than the edge
+  // itself, and snapping onto it shears the grid by half a cell. So every
+  // candidate is judged by what it scores, and the best of the fits wins.
+  let best = null;
+  const consider = (q) => {
+    if (!q || !validQuad(q, w, h)) return;
+    const sc = scoreQuad(prepared, w, h, q);
+    if (sc && (!best || sc.score > best.sc.score)) best = { quad: q, sc };
+  };
+
+  consider(quad.map((p) => p.slice()));
+  const snapped = snapQuad(prepared.mag, w, h, quad, 10);
+  consider(snapped);
+  if (snapped) consider(snapQuad(prepared.mag, w, h, snapped, 3));
+  return best;
+}
+
+/**
+ * Score-guided fit (scale + centre) for a candidate that already looks like a
+ * board. This is what recovers the true edge when the ridges are weak — a
+ * bordered board, uneven light, a row of pieces — but it costs ~20 samples, so
+ * it is only ever run for one candidate per pyramid level, and only when that
+ * candidate is plausible.
+ */
+function fitCandidate(prepared, w, h, quad) {
+  const q = refineQuad(prepared, w, h, quad, { inset: true, passes: 3 });
+  if (!q || !validQuad(q, w, h)) return null;
   const sc = scoreQuad(prepared, w, h, q);
-  if (!sc) return null;
-  return { quad: q, score: sc.score, sep: sc.sep };
+  return sc ? { quad: q, sc } : null;
 }
 
 /** Score high enough that no other quad in the frame can plausibly beat it. */
 const DECISIVE = 3.0;
+/** The same for the trimmed score, which is the only one an occluded board has. */
+const DECISIVE_TRIM = 4.3;
+/** Strict score below this means "the board is hidden, not absent". */
+const HIDDEN = 1.6;
+/** Above this a candidate is worth the score-guided fit. */
+const PLAUSIBLE = 1.1;
 
 /**
  * Find the most chessboard-looking quad.
@@ -548,7 +634,13 @@ const DECISIVE = 3.0;
  * and quantised coarser still at 1/4 scale) are always snapped onto their
  * ridges before being judged.
  *
- * @returns {{quad: number[][], score: number, sep: number}|null}
+ * A quad is accepted when the strict score clears 2.5, or — if part of the
+ * board is covered by a hand or an arm — when the trimmed score clears 3.5,
+ * which no quad that is merely *near* a board ever reaches. That is what lets
+ * the board be found while somebody is leaning over it, without letting the
+ * detector lock onto a table.
+ *
+ * @returns {{quad: number[][], score: number, sep: number, trimmed: number}|null}
  */
 export function detectQuad(prepared, w, h) {
   const levels = [
@@ -559,24 +651,44 @@ export function detectQuad(prepared, w, h) {
   let best = null;
   const tried = [];
 
+  const done = (r) => ({
+    quad: r.quad, score: r.sc.score, sep: r.sc.sep, trimmed: r.sc.trim(),
+  });
+
   for (const [mag, mw, mh] of levels) {
     const sx = w / mw, sy = h / mh;
     const list = quadsFromLines(mag, mw, mh, 40);
+    const maxCands = best && best.sc.score > 0.8 ? 4 : 3;
     let used = 0;
     for (const c of list) {
-      if (used >= 4) break;
+      if (used >= maxCands) break;
       const quad = c.quad.map(([x, y]) => [x * sx, y * sy]);
       if (tried.some((t) => quadDist(t, quad) < w * 0.02)) continue;
       tried.push(quad);
       used++;
       const r = refineCandidate(prepared, w, h, quad);
-      if (r && (!best || r.score > best.score)) best = r;
-      if (best && best.score >= DECISIVE) return best;
+      if (r && (!best || r.sc.score > best.sc.score)) best = r;
+      if (best && best.sc.score >= DECISIVE) return done(best);
+      // partially covered board: only now is the trimmed pass worth its cost
+      if (best && best.sc.score > HIDDEN && best.sc.trim() >= DECISIVE_TRIM) return done(best);
     }
   }
 
-  if (!best || best.score < 2.5 || best.sep < 0.18) return null;
-  return best;
+  // The score-guided fit is what saves a bordered board, a hard light gradient
+  // or a row of pieces along an edge. It costs ~20 samples, so it is run once,
+  // on the single best candidate, and only if that candidate is board-ish.
+  if (best && best.sc.score < DECISIVE && best.sc.score > PLAUSIBLE) {
+    const fitted = fitCandidate(prepared, w, h, best.quad);
+    if (fitted && fitted.sc.score > best.sc.score) best = fitted;
+    if (best.sc.score >= DECISIVE) return done(best);
+    if (best.sc.score > HIDDEN && best.sc.trim() >= DECISIVE_TRIM) return done(best);
+  }
+
+  if (!best) return null;
+  const sc = best.sc;
+  if (sc.sep < 0.18) return null;
+  if (!(sc.score > 2.5 || sc.trim() > 3.5)) return null;
+  return done(best);
 }
 
 /** Circular distance between two line directions (degrees, both mod 180). */
@@ -750,18 +862,35 @@ function snapLine(mag, w, h, a, b, range = 9) {
   const half = Math.max(6, L / 2 - 4);
   const stepT = Math.max(2, L / 22);
   const nS = Math.floor((2 * half) / stepT) + 1;
+  const SEG = 6;
+  const segSum = new Float64Array(SEG), segN = new Uint8Array(SEG);
 
   const scoreAt = (c, s, off) => {
     const vx = ux * c - uy * s, vy = ux * s + uy * c;
     const nx = -vy, ny = vx;
-    let sum = 0, n = 0;
+    // Score six contiguous stretches of the side and average the middle four.
+    // Dropping the weakest and strongest stretch is what keeps the snap on the
+    // board edge when a hand hides part of it (weak) or a piece sits on it
+    // (strong): a plain mean over the whole side is dragged off by either.
+    segSum.fill(0); segN.fill(0);
     for (let k = 0; k < nS; k++) {
       const t = -half + k * stepT;
       const v = sampleBilinear(mag, w, h, mx + nx * off + vx * t, my + ny * off + vy * t);
       if (v === null) continue;
-      sum += Math.min(v, 700); n++;
+      const g = Math.min(SEG - 1, (k * SEG / nS) | 0);
+      segSum[g] += Math.min(v, 700); segN[g]++;
     }
-    return n ? sum / n : 0;
+    let lo = Infinity, hi = -Infinity, sum = 0, n = 0;
+    for (let g = 0; g < SEG; g++) {
+      if (!segN[g]) continue;
+      const m = segSum[g] / segN[g];
+      sum += m; n++;
+      if (m < lo) lo = m;
+      if (m > hi) hi = m;
+    }
+    if (!n) return 0;
+    if (n <= 3) return sum / n;
+    return (sum - lo - hi) / (n - 2);
   };
 
   // coarse over angle and offset, then a fine pass at half-pixel resolution so
@@ -825,20 +954,28 @@ export function refineQuad(prepared, w, h, quad, { inset = false, passes = 2, it
   if (!bestScore) return quad;
 
   if (inset) {
+    // Fit the quad to the board by *score*, not by ridge strength: first the
+    // scale about the centre, then the centre offset. (Searching the two axes
+    // together costs 90 samples, the axes separately 19, and the two are almost
+    // independent — the scale is what matters, the offset only fine-tunes.)
     const cx = (best[0][0] + best[1][0] + best[2][0] + best[3][0]) / 4;
     const cy = (best[0][1] + best[1][1] + best[2][1] + best[3][1]) / 4;
     const base = best.map((p) => p.slice());
     const size = (Math.hypot(base[1][0] - base[0][0], base[1][1] - base[0][1])
       + Math.hypot(base[2][0] - base[1][0], base[2][1] - base[1][1])) / 2;
-    for (const k of [1, 0.98, 0.96, 0.94, 0.92, 0.9, 0.88, 0.86, 0.84, 1.02]) {
-      for (const sx of [-0.02, 0, 0.02]) {
-        for (const sy of [-0.02, 0, 0.02]) {
-          const ox = cx + size * sx, oy = cy + size * sy;
-          const cand = base.map(([x, y]) => [ox + (x - ox) * k, oy + (y - oy) * k]);
-          if (!validQuad(cand, w, h)) continue;
-          const sc = scoreQuad(prepared, w, h, cand);
-          if (sc && sc.score > bestScore.score) { best = cand; bestScore = sc; }
-        }
+    const tryIt = (cand) => {
+      if (!validQuad(cand, w, h)) return;
+      const sc = scoreQuad(prepared, w, h, cand);
+      if (sc && sc.score > bestScore.score) { best = cand; bestScore = sc; }
+    };
+    for (const kk of [1, 0.98, 0.96, 0.94, 0.92, 0.9, 0.88, 0.86, 0.84, 1.02, 0.8, 0.78]) {
+      tryIt(base.map(([x, y]) => [cx + (x - cx) * kk, cy + (y - cy) * kk]));
+    }
+    const scaled = best;
+    for (const sx of [-0.02, 0, 0.02]) {
+      for (const sy of [-0.02, 0, 0.02]) {
+        if (!sx && !sy) continue;
+        tryIt(scaled.map(([x, y]) => [x + size * sx, y + size * sy]));
       }
     }
   }
@@ -945,7 +1082,7 @@ export function scaleHomography(H, sx, sy) {
  * board is not moving; see BoardTracker.
  */
 export function describeBoard(prepared, w, h, H) {
-  return describeSquares(prepared.gray, w, h, H, 0.05);
+  return describeSquares(prepared.gray, w, h, H, 0.08);
 }
 
 /**
@@ -1063,6 +1200,7 @@ export class BoardTracker {
     this.quad = null;
     this.H = null;
     this.score = 0;
+    this.scoreTrim = 0;
     this.tick = 0;
     this.misses = 0;
     this.badFrames = 0;
@@ -1073,22 +1211,59 @@ export class BoardTracker {
     this.still = false;
     this.motion = Infinity;
     this.redetected = false;
+    this.vel = null;
     this.frames = 0;
+    this.lastDetect = -999;
   }
 
   reset() {
     this.quad = null;
     this.H = null;
     this.score = 0;
+    this.scoreTrim = 0;
     this.misses = 0;
     this.badFrames = 0;
     this.tick = 0;
     this.prevThumb = null;
     this.lastPrepared = null;
+    this.vel = null;
   }
 
   get locked() {
     return !!this.quad;
+  }
+
+  /**
+   * Where the board is expected to be on the next frame: the last quad plus the
+   * smoothed corner velocity, capped at a fraction of the board size so one bad
+   * frame cannot fling the prediction off the screen.
+   */
+  predict(quad = this.quad) {
+    const v = this.vel;
+    if (!quad || !v) return quad;
+    let size = 0;
+    for (let i = 0; i < 4; i++) size += Math.hypot(quad[(i + 1) % 4][0] - quad[i][0], quad[(i + 1) % 4][1] - quad[i][1]);
+    const cap = size / 4 * 0.08;
+    return quad.map(([x, y], i) => {
+      const dx = Math.max(-cap, Math.min(cap, v[i][0]));
+      const dy = Math.max(-cap, Math.min(cap, v[i][1]));
+      return [x + dx, y + dy];
+    });
+  }
+
+  /** Smoothed per-corner motion, used by predict(). */
+  trackVelocity(prev, next) {
+    if (!prev) return;
+    const v = this.vel;
+    if (!v) {
+      this.vel = next.map(([x, y], i) => [x - prev[i][0], y - prev[i][1]]);
+      return;
+    }
+    for (let i = 0; i < 4; i++) {
+      const dx = next[i][0] - prev[i][0], dy = next[i][1] - prev[i][1];
+      v[i][0] = v[i][0] * 0.55 + dx * 0.45;
+      v[i][1] = v[i][1] * 0.55 + dy * 0.45;
+    }
   }
 
   /**
@@ -1115,22 +1290,30 @@ export class BoardTracker {
       this.quadShift = 0;
       this.motion = motion;
       this.still = true;
+      // nothing is moving, so nothing will be moving next frame either: a
+      // stale velocity would throw the next prediction off
+      this.vel = null;
       return {
-        quad: this.quad, H: this.H, score: this.score, quadShift: 0,
-        redetected: false, motion, prepared: this.lastPrepared, still: true,
+        quad: this.quad, H: this.H, score: this.score, scoreTrim: this.scoreTrim,
+        quadShift: 0, redetected: false, motion, prepared: this.lastPrepared, still: true,
       };
     }
     this.still = false;
 
     const prepared = prepareFrame(rgba, w, h);
     this.lastPrepared = prepared;
+    const before = this.quad;
 
-    // Re-detect only when something actually suggests the lock is stale:
-    // losing the score, a big jump, or a slow heartbeat. Re-detecting on a
-    // healthy lock just makes the grid jump around.
-    const due = !this.quad || this.score < 3
-      || this.tick++ % this.detectEvery === 0;
+    // Is the board still there, even if part of it is covered? The trimmed
+    // score answers that; the strict score only answers "is all of it visible".
+    const stale = this.quad && this.score < 3 && this.scoreTrim < 2.6;
+    const heartbeat = this.tick++ % this.detectEvery === 0;
+    // While a hand or an arm covers the board a fresh search cannot succeed, so
+    // it must not run on every frame: it costs tens of milliseconds and would
+    // stall the overlay exactly while the game is being played.
+    const due = !this.quad || heartbeat || (stale && this.tick - this.lastDetect >= 5);
     if (due) {
+      this.lastDetect = this.tick;
       const det = detectQuad(prepared, w, h);
       if (det) {
         this.misses = 0;
@@ -1139,33 +1322,49 @@ export class BoardTracker {
         // existing lock: re-seating the grid by a pixel for no reason is what
         // made every square look like it had changed.
         const close = this.quad && meanCornerShift(this.quad, det.quad) < w * 0.02;
-        if (!close) this.quad = refineQuad(prepared, w, h, det.quad, { inset: true, passes: 3 });
+        if (!close) {
+          this.quad = refineQuad(prepared, w, h, det.quad, { inset: true, passes: 3 });
+          // a re-seat is a jump, not motion: do not feed it to the predictor
+          this.vel = null;
+        }
         const sc = scoreQuad(prepared, w, h, this.quad);
-        if (sc) this.score = sc.score;
+        if (sc) { this.score = sc.score; this.scoreTrim = sc.trim(); }
       } else if (this.quad) {
-        this.misses++;
-        if (this.misses > 4) this.reset();
+        // A hand across the board hides the rim for a while; losing the lock on
+        // the first few misses is what forces a full re-detection in the middle
+        // of a game. If the trimmed score says the board is still there, this
+        // miss means nothing at all and must not count.
+        if (this.scoreTrim > 2.2) this.misses = 0;
+        else if (++this.misses > 10) this.reset();
       }
     }
 
-    if (this.quad && this.score < 4) {
-      // Only re-fit when the lock is starting to slip. A well-locked, static
-      // board must not be re-fitted at all: the snap can hop a few pixels onto
-      // a decorative border, and that silently poisons every square diff.
-      const refined = refineQuad(prepared, w, h, this.quad, { passes: 1, polish: false });
-      if (refined && validQuad(refined, w, h)) {
-        const sc = scoreQuad(prepared, w, h, refined);
-        if (sc && sc.score > 2.2) {
-          // only follow the ridge when it actually moved: re-fitting a static
-          // board on every frame is what makes the sampling grid wobble
-          if (meanCornerShift(this.quad, refined) > 0.6) this.quad = refined;
-          this.score = sc.score;
-          this.badFrames = 0;
-        } else if (++this.badFrames > 3) {
-          // the board is gone or the camera swung away: drop the lock so the
-          // next frame does a fresh search
-          this.reset();
+    if (this.quad) {
+      // Follow the board on every moving frame, starting from where the last
+      // frames say it is going. Predicting first is what keeps the grid glued
+      // to the board during a pan instead of lagging a frame behind (and it
+      // widens the distance the local snap can recover from, so the lock
+      // survives a brisk camera move without a full re-detection).
+      const start = this.predict(this.quad) || this.quad;
+      const refined = refineQuad(prepared, w, h, start, { passes: 1, polish: false });
+      const sc = refined && validQuad(refined, w, h) ? scoreQuad(prepared, w, h, refined) : null;
+      const trimScore = sc ? sc.trim() : 0;
+      if (sc && trimScore > 1.9) {
+        // only follow the ridge when it actually moved: re-fitting a static
+        // board is what makes the sampling grid wobble. On a healthy lock that
+        // means a whole pixel; on a slipping one, half a pixel is worth taking.
+        const shift = before ? meanCornerShift(before, refined) : Infinity;
+        if (shift > (this.score > 4 ? 1.2 : 0.6)) {
+          this.quad = refined;
+          this.trackVelocity(before, refined);
         }
+        this.score = sc.score;
+        this.scoreTrim = trimScore;
+        this.badFrames = 0;
+      } else if (++this.badFrames > 24) {
+        // the board is gone or the camera swung away: drop the lock so the
+        // next frame does a fresh search
+        this.reset();
       }
     }
 
@@ -1175,8 +1374,8 @@ export class BoardTracker {
     this.quadShift = quadBefore && this.quad ? meanCornerShift(quadBefore, this.quad) : 0;
     this.motion = motion;
     return {
-      quad: this.quad, H: this.H, score: this.score, quadShift: this.quadShift,
-      redetected: this.redetected, motion, prepared, still: false,
+      quad: this.quad, H: this.H, score: this.score, scoreTrim: this.scoreTrim,
+      quadShift: this.quadShift, redetected: this.redetected, motion, prepared, still: false,
     };
   }
 }
@@ -1185,8 +1384,4 @@ function meanCornerShift(a, b) {
   let s = 0;
   for (let i = 0; i < 4; i++) s += Math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]);
   return s / 4;
-}
-
-function blendQuad(a, b, t) {
-  return a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]);
 }
