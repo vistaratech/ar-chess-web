@@ -51,8 +51,8 @@ opening, so the whole pipeline can be watched on a desktop.
 - **How small is too small?** What matters is the size of a *square* in the frame
   the app processes (the camera frame is scaled down to at most 720 px on the long
   edge). At 11 px per square and up — a board at ~25 % of the short side —
-  detection is occasional (about 3 in 4 poses in the sweep below); at 12 px and up
-  (~35 %) it is essentially certain, and at 20 px (~50 %) it never missed in the
+  detection is occasional (about 3 in 4 poses in the sweep below); at 16 px and up
+  (~35 %) it is essentially certain, and at 22 px (~50 %) it never missed in the
   sweep. Below ~10 px per square the board's rim is softer than the squares inside
   it and the search stops finding it — at that size the pieces are a few pixels
   across and there is nothing left to read anyway.
