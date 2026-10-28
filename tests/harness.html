@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vision harness</title>
+<style>
+  body { background: #111; color: #ddd; font: 13px/1.45 ui-monospace, monospace; margin: 0; padding: 16px; }
+  canvas { display: block; border: 1px solid #444; image-rendering: pixelated; }
+  pre { white-space: pre-wrap; }
+  .ok { color: #6f6; } .bad { color: #f66; } .warn { color: #fc6; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="270"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+import { Chess } from '../vendor/chess.js';
+import {
+  BoardTracker, boardHomography, describeSquares, grayFromRGBA, project, scoreQuad, squareDiff, median, prepare,
+} from '../js/vision.js';
+import { renderScene, makePose } from './scene.js';
+import { MoveReader, inferMove, indexSquare } from '../js/track.js';
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 480), H = +(qp.get('h') || 270);
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d');
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+function frame() {
+  const img = ctx.getImageData(0, 0, W, H);
+  return img.data;
+}
+
+function quadError(a, b) {
+  if (!a || !b) return Infinity;
+  // compare as unordered point sets (orientation of the detected quad may differ)
+  let best = Infinity;
+  for (let shift = 0; shift < 4; shift++) {
+    let s = 0;
+    for (let i = 0; i < 4; i++) {
+      const p = a[i], q = b[(i + shift) % 4];
+      s += Math.hypot(p[0] - q[0], p[1] - q[1]);
+    }
+    best = Math.min(best, s / 4);
+  }
+  return best;
+}
+
+/* ------------------------------------------------------------------ */
+/* 1. board detection across camera poses                              */
+/* ------------------------------------------------------------------ */
+log('=== 1. detection ===');
+const poses = [];
+for (let i = 0; i < 14; i++) {
+  poses.push({
+    rot: (i % 7) * 0.012 - 0.04,
+    tilt: 0.2 + (i % 5) * 0.08,
+    skew: ((i % 4) - 1.5) * 0.03,
+    size: Math.min(W, H) * (0.66 + (i % 3) * 0.1),
+    cx: W * (0.45 + ((i % 3) - 1) * 0.04),
+    cy: H * (0.48 + ((i % 4) - 1.5) * 0.015),
+    light: (i % 3) * 0.08,
+    noise: 10 + (i % 4) * 4,
+    clutter: i % 2 ? 2 : 0,
+    border: i % 3 === 0 ? 0.03 : 0,
+  });
+}
+
+let ok = 0, total = 0, worst = 0, ms = 0;
+for (const [i, p] of poses.entries()) {
+  const quad = makePose(W, H, p);
+  renderScene(ctx, { w: W, h: H, fen: START, quad, border: p.border || 0, light: p.light, noise: p.noise, clutter: p.clutter, seed: i + 1 });
+  const t0 = performance.now();
+  const tracker = new BoardTracker({ side: 'w' });
+  const res = tracker.update(frame(), W, H);
+  const dt = performance.now() - t0;
+  ms += dt;
+  const err = quadError(res.quad, quad);
+  const rel = err / Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+  total++;
+  if (res.quad && rel < 0.06) ok++; else worst = Math.max(worst, rel);
+  const gtsc = scoreQuad(prepare(grayFromRGBA(frame(), W, H), W, H), W, H, quad);
+  log(`pose ${String(i).padStart(2)} tilt=${p.tilt.toFixed(2)} err=${isFinite(rel) ? (rel * 100).toFixed(1) + '%' : 'none'} ${res.quad && rel < 0.06 ? 'ok' : 'FAIL'} (${dt.toFixed(0)}ms) gtscore=${gtsc ? gtsc.score.toFixed(1) + '/sep' + gtsc.sep.toFixed(0) : '-'} det=${res.score.toFixed(1)}`);
+}
+log(`detection: ${ok}/${total} within 6% of board width; mean ${(ms / total).toFixed(0)}ms`);
+
+/* ------------------------------------------------------------------ */
+/* 2. orientation: a1 must be dark, h1 light, for both sides            */
+/* ------------------------------------------------------------------ */
+log('\n=== 2. orientation ===');
+for (const side of ['w', 'b']) {
+  const quad = makePose(W, H, { tilt: 0.3, size: Math.min(W, H) * 0.74 });
+  renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 8, seed: 7 });
+  const rgba = frame();
+  const gray = grayFromRGBA(rgba, W, H);
+  const tr = new BoardTracker({ side });
+  const res = tr.update(rgba, W, H);
+  const desc = describeSquares(gray, W, H, res.H);
+  const mean = (i) => { let s = 0; for (let k = 0; k < 9; k++) s += desc[i * 9 + k]; return s / 9; };
+  const rank1 = Array.from({ length: 8 }, (_, i) => mean(i).toFixed(0)).join(' ');
+  const good = mean(0) < mean(7);
+  log(`side ${side}: rank1 = ${rank1} -> a1<h1 ${good ? 'ok' : 'WRONG'} (quad err ${quadError(res.quad, quad).toFixed(1)}px)`);
+}
+
+/* ---- stability: identical frames must not move the sampling grid       */
+log('\n=== 2b. stability (same frame x8) ===');
+{
+  const quad = makePose(W, H, { tilt: 0.3, size: Math.min(W, H) * 0.74 });
+  renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0.02, light: 0.05, noise: 8, seed: 7 });
+  const bytes = ctx.getImageData(0, 0, W, H).data;
+  const tr = new BoardTracker({ side: 'w' });
+  let prev = null;
+  for (let i = 0; i < 8; i++) {
+    const res = tr.update(bytes, W, H);
+    const gray = grayFromRGBA(bytes, W, H);
+    const d = res.H ? describeSquares(gray, W, H, res.H) : null;
+    if (prev && d) {
+      const df = squareDiff(d, prev);
+      log(`  frame ${i}: medDiff=${median(df).toFixed(2)} max=${Math.max(...df).toFixed(1)} quadErr=${quadError(res.quad, quad).toFixed(1)}px`);
+    }
+    prev = d;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. full pipeline: play a game and read every move                    */
+/* ------------------------------------------------------------------ */
+log('\n=== 3. move reading ===');
+const moves = ['e4', 'c5', 'Nf3', 'd6', 'd4', 'cxd4', 'Nxd4', 'Nf6', 'Nc3', 'a6', 'Be3', 'e6', 'f3', 'b5', 'Qd2', 'Nbd7', 'g4', 'h6', 'O-O-O', 'Bb7'];
+const quad = makePose(W, H, { tilt: 0.26, size: Math.min(W, H) * 0.8 });
+const tracker = new BoardTracker({ side: 'w' });
+const reader = new MoveReader();
+const game = new Chess();
+
+renderScene(ctx, { w: W, h: H, fen: game.fen(), quad, border: 0.02, light: 0.04, noise: 9, seed: 3 });
+let rgba = frame();
+let res = tracker.update(rgba, W, H);
+let gray = grayFromRGBA(rgba, W, H);
+reader.commit(describeSquares(gray, W, H, res.H));
+
+let pass = 0;
+for (const san of moves) {
+  const want = game.move(san);
+  renderScene(ctx, { w: W, h: H, fen: game.fen(), quad, border: 0.02, light: 0.04, noise: 9 + Math.random() * 3, seed: 3 + moves.indexOf(san) });
+  let got = null, note = '';
+  for (let f = 0; f < 3; f++) {
+    rgba = frame();
+    res = tracker.update(rgba, W, H);
+    gray = grayFromRGBA(rgba, W, H);
+    const desc = res.H ? describeSquares(gray, W, H, res.H) : null;
+    if (!desc) { note = 'no board'; continue; }
+    const r = reader.push(desc);
+    if (!r.settled) continue;
+    const inf = inferMove(game.moves({ verbose: true }), r.changed);
+    if (inf.accepted) {
+      got = inf.move;
+      reader.commit(desc);
+      game.move({ from: inf.move.from, to: inf.move.to, promotion: 'q' });
+      break;
+    }
+    note = `changed=${[...r.changed].map(indexSquare).join(',')} best=${inf.best ? inf.best.move.san : '-'} score=${inf.best ? inf.best.score.toFixed(2) : '-'} margin=${isFinite(inf.margin) ? inf.margin.toFixed(2) : 'inf'}`
+      + (inf.ambiguous ? ' ambiguous' : '');
+    reader.commit(desc);
+  }
+  const okMove = got && got.from === want.from && got.to === want.to;
+  if (okMove) pass++;
+  log(`${san.padEnd(6)} want=${want.from}${want.to} got=${got ? got.from + got.to : '---'} ${okMove ? 'ok' : 'FAIL ' + note}`);
+}
+log(`move reading: ${pass}/${moves.length}`);
+log('\ndone');
+window.__done = true;
+window.__summary = { detection: `${ok}/${total}`, moveRead: `${pass}/${moves.length}` };
+</script>
+</body>
+</html>

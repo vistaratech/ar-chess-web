@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>debug7</title>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}canvas{border:1px solid #444}pre{white-space:pre}</style>
+</head><body>
+<canvas id="c"></canvas>
+<pre id="out"></pre>
+<script type="module">
+import { prepare, grayFromRGBA, scoreQuad, candidateQuads, snapQuad, detectQuad, validQuad, houghLines } from '../js/vision.js';
+import { renderScene, makePose } from './scene.js';
+
+const qp = new URLSearchParams(location.search);
+const W = +(qp.get('w') || 640), H = +(qp.get('h') || 360);
+const cv = document.getElementById('c'); cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const L = [];
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n'); };
+const fmt = (q) => q.map((p) => p.map((v) => v.toFixed(1)).join(',')).join('  ');
+const err = (a, b) => {
+  if (!a || !b) return Infinity;
+  let best = Infinity;
+  for (let k = 0; k < 4; k++) {
+    let s = 0;
+    for (let i = 0; i < 4; i++) s += Math.hypot(a[i][0] - b[(i + k) % 4][0], a[i][1] - b[(i + k) % 4][1]);
+    best = Math.min(best, s / 4);
+  }
+  return best;
+};
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const poses = [];
+for (let i = 0; i < 14; i++) {
+  poses.push({
+    rot: (i % 7) * 0.012 - 0.04,
+    tilt: 0.2 + (i % 5) * 0.08,
+    skew: ((i % 4) - 1.5) * 0.03,
+    size: Math.min(W, H) * (0.66 + (i % 3) * 0.1),
+    cx: W * (0.45 + ((i % 3) - 1) * 0.04),
+    cy: H * (0.48 + ((i % 4) - 1.5) * 0.015),
+    light: (i % 3) * 0.08,
+    noise: 10 + (i % 4) * 4,
+    clutter: i % 2 ? 2 : 0,
+    border: i % 3 === 0 ? 0.03 : 0,
+  });
+}
+
+for (const [i, p] of poses.entries()) {
+  const quad = makePose(W, H, p);
+  renderScene(ctx, { w: W, h: H, fen: START, quad, border: p.border || 0, light: p.light, noise: p.noise, clutter: p.clutter, seed: i + 1 });
+  const prep = prepare(grayFromRGBA(ctx.getImageData(0, 0, W, H).data, W, H), W, H);
+  const bw = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+  const gt = scoreQuad(prep, W, H, quad);
+  const t0 = performance.now();
+  const cands = candidateQuads(prep, W, H);
+  const tE = performance.now() - t0;
+  const d = detectQuad(prep, W, H);
+  const tD = performance.now() - t0;
+  log(`pose ${String(i).padStart(2)} tilt=${p.tilt.toFixed(2)} size=${p.size.toFixed(0)} light=${p.light.toFixed(2)} noise=${p.noise} clut=${p.clutter} bd=${p.border}`);
+  log(`   GT score=${gt.score.toFixed(1)} sep=${gt.sep.toFixed(0)} sd=${(gt.sdA + gt.sdB).toFixed(1)} | cands=${cands.length} enum=${tE.toFixed(0)}ms detect=${tD.toFixed(0)}ms -> ${d ? `score=${d.score.toFixed(1)} err=${(err(d.quad, quad) / bw * 100).toFixed(1)}%` : 'NONE'}`);
+
+  if (cands.length < 6) {
+    const ls = houghLines(prep.mag, W, H, 14);
+    log(`   lines(${ls.length}): ` + ls.map((l) => `${l.theta.toFixed(0)}@${l.rho.toFixed(0)}`).join(' '));
+    log(`   GT quad: ${fmt(quad)}`);
+  }
+
+  // how would the top candidates rank if we scored every one of them?  const tried = [];
+  let shown = 0;
+  for (const c of cands) {
+    if (tried.length >= 40) break;
+    if (tried.some((t) => err(t, c.quad) < 4)) continue;
+    tried.push(c.quad);
+    const s1 = snapQuad(prep.mag, W, H, c.quad, 10);
+    const s2 = s1 ? snapQuad(prep.mag, W, H, s1, 3) : null;
+    const q = s2 || s1 || c.quad;
+    const sc = validQuad(q, W, H) ? scoreQuad(prep, W, H, q) : null;
+    const rel = err(q, quad) / bw;
+    if (sc) log(`     #${shown} area=${(c.area / (W * H) * 100).toFixed(1)}% rawErr=${(err(c.quad, quad) / bw * 100).toFixed(1)}% snapErr=${(rel * 100).toFixed(1)}% score=${sc.score.toFixed(1)} sep=${sc.sep.toFixed(0)}`);
+    else log(`     #${shown} area=${(c.area / (W * H) * 100).toFixed(1)}% rawErr=${(err(c.quad, quad) / bw * 100).toFixed(1)}% invalid`);
+    shown++;
+    if (shown >= 8) break;
+  }
+}
+window.__done = true;
+</script></body></html>

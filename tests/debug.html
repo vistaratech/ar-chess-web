@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>debug</title>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}canvas{border:1px solid #444}pre{white-space:pre}</style>
+</head><body>
+<canvas id="c" width="480" height="270"></canvas>
+<pre id="out"></pre>
+<script type="module">
+import { prepare, grayFromRGBA, scoreQuad, detectQuad, refineQuad, boardHomography, describeSquares, project, solveHomography } from '../js/vision.js';
+import { renderScene, makePose } from './scene.js';
+import { Chess } from '../vendor/chess.js';
+
+const W = 480, H = 270;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out');
+const lines = [];
+const log = (s = '') => { lines.push(s); out.textContent = lines.join('\n'); };
+
+const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const quad = makePose(W, H, { tilt: 0.3, size: Math.min(W, H) * 0.74 });
+renderScene(ctx, { w: W, h: H, fen: START, quad, border: 0, light: 0.04, noise: 6, seed: 7 });
+const rgba = ctx.getImageData(0, 0, W, H).data;
+const gray = grayFromRGBA(rgba, W, H);
+const prep = prepare(gray, W, H);
+
+log('GT quad: ' + quad.map(p => p.map(v => v.toFixed(1)).join(',')).join('  '));
+
+/* score as a function of uniform scale around the centroid */
+const cx = quad.reduce((a, p) => a + p[0], 0) / 4;
+const cy = quad.reduce((a, p) => a + p[1], 0) / 4;
+log('\nscale   contrast  grid   edge   score');
+for (let k = 0.86; k <= 1.141; k += 0.02) {
+  const q = quad.map(([x, y]) => [cx + (x - cx) * k, cy + (y - cy) * k]);
+  const sc = scoreQuad(prep, W, H, q);
+  log(`${k.toFixed(2)}    ${sc.contrast.toFixed(1).padStart(6)}  ${sc.grid.toFixed(2)}  ${sc.edge.toFixed(2)}  ${sc.score.toFixed(2)}`);
+}
+
+/* what does the detector find? */
+const det = detectQuad(prep, W, H);
+log('\ndetected: ' + (det ? det.quad.map(p => p.map(v => v.toFixed(1)).join(',')).join('  ') : 'none'));
+if (det) {
+  log('score(detected)=' + det.score.toFixed(2) + '  score(gt)=' + scoreQuad(prep, W, H, quad).score.toFixed(2));
+  log('refined : ' + refineQuad(prep, W, H, det.quad, { inset: true, passes: 3 }).map(p => p.map(v => v.toFixed(1)).join(',')).join('  '));
+}
+
+/* orientation check with the true quad */
+const Hgt = boardHomography(quad, 'w');
+const desc = describeSquares(gray, W, H, Hgt);
+const mean = i => { let s = 0; for (let k = 0; k < 9; k++) s += desc[i * 9 + k]; return s / 9; };
+log('\nrank1 (true quad): ' + Array.from({ length: 8 }, (_, i) => mean(i).toFixed(0)).join(' '));
+log('rank8 (true quad): ' + Array.from({ length: 8 }, (_, i) => mean(56 + i).toFixed(0)).join(' '));
+
+/* where does the a1 cell centre land? */
+log('a1 centre px: ' + project(Hgt, 0.5, 0.5).map(v => v.toFixed(1)));
+log('h1 centre px: ' + project(Hgt, 7.5, 0.5).map(v => v.toFixed(1)));
+
+window.__done = true;
+</script></body></html>
