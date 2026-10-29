@@ -19,6 +19,8 @@ import { Coach } from './coach.js';
 const MAX_EDGE = 720;          // detection resolution, long edge
 const MS = 2000;               // engine time budget
 const DEMO = new URLSearchParams(location.search).has('demo');
+let positionConfirmed = DEMO;
+let positionPrompted = DEMO;
 const SIDE_KEY = 'ar-chess.side';
 const ENGINE_STALL_MS = 8000;  // a worker that has not answered by then is wedged
 const ENGINE_RETRY_MS = 4000;  // backoff after a worker/engine failure
@@ -151,7 +153,8 @@ function describeSuggestion(s) {
  */
 function showBest() {
   const g = coach.guidance;
-  if (g) bestEl.textContent = describeSuggestion(g);
+  if (!positionConfirmed) bestEl.textContent = 'confirm board position to analyze';
+  else if (g) bestEl.textContent = describeSuggestion(g);
   else if (coach.thinking) bestEl.textContent = 'thinking…';
   else if (engineError) bestEl.textContent = `${engineError} — retrying`;
   else if (game.game_over()) bestEl.textContent = game.in_checkmate() ? 'checkmate' : 'draw';
@@ -166,6 +169,10 @@ function showBest() {
  * would be wrong.
  */
 function askEngine() {
+  if (!positionConfirmed) {
+    showBest();
+    return;
+  }
   const req = coach.request();
   showBest();
   if (!req) return;
@@ -204,7 +211,7 @@ function askEngine() {
  * running; a worker that exceeds its budget is restarted.
  */
 function ensureAdvice(now) {
-  if (!coach.myTurn || coach.guidance || desynced) return;
+  if (!positionConfirmed || !coach.myTurn || coach.guidance || desynced) return;
 
   if (coach.thinking) {
     if (thinkingSince && now - thinkingSince < ENGINE_STALL_MS) return;
@@ -417,15 +424,19 @@ function step(now) {
       lastDesc = desc;
     }
     if (!positionDialog.open) {
-      const r = reader.push(desc, { gridMoved: res.gridMoved, now: performance.now() });
-      occluded = !!r.implausible;
-      if (r.settled || r.stuck) readBoard(desc, r);
-      else if (!r.changed.size && sampler.drift(res) > 0.04) {
-        // Nothing is changing, so the reference can follow the board: move the
-        // sampling grid onto the squares it is sampling and re-base from there.
-        // Doing this while a change is pending would throw that change away.
-        lastDesc = sampler.refresh(res.prepared, vw, vh, res);
-        reader.commit(lastDesc);
+      if (!positionConfirmed && !DEMO) {
+        if (!positionPrompted) openPositionEditor({ useKnownPosition: false });
+      } else {
+        const r = reader.push(desc, { gridMoved: res.gridMoved, now: performance.now() });
+        occluded = !!r.implausible;
+        if (r.settled || r.stuck) readBoard(desc, r);
+        else if (!r.changed.size && sampler.drift(res) > 0.04) {
+          // Nothing is changing, so the reference can follow the board: move the
+          // sampling grid onto the squares it is sampling and re-base from there.
+          // Doing this while a change is pending would throw that change away.
+          lastDesc = sampler.refresh(res.prepared, vw, vh, res);
+          reader.commit(lastDesc);
+        }
       }
     }
   } else {
@@ -496,13 +507,14 @@ function readBoard(desc, r) {
   }
 
   // Nothing conclusive this time. The coach has dropped the recommendation, so
-  // the arrow cannot linger on a position that has moved on; do not ask again
-  // for the same position or it would simply come back.
+  // the arrow cannot linger on a position that has moved on. Do not infer a new
+  // position from the changed squares: ask the user to confirm the board.
   desynced = true;
-  setStatus(r.stuck
-    ? 'Board changed a lot — tap Resync if that was not a hand'
-    : 'Could not read that move — tap Resync', 'bad');
+  positionConfirmed = false;
+  stopSearchWorker();
+  setStatus('Could not read the position — please correct the board', 'bad');
   showBest();
+  openPositionEditor({ useKnownPosition: false });
 }
 
 function updateStatus(res) {
@@ -516,7 +528,11 @@ function updateStatus(res) {
     return;
   }
   if (desynced) {
-    setStatus('Could not read that move — tap Resync', 'bad');
+    setStatus('Could not read the position — please correct the board', 'bad');
+    return;
+  }
+  if (!positionConfirmed) {
+    setStatus('Confirm the current board position to analyze', '');
     return;
   }
   if (game.game_over()) {
@@ -588,7 +604,7 @@ function drawOverlay() {
   // `guidance` is null unless the recommendation belongs to the position on
   // the board right now and it is our turn — the single source of truth for
   // "should the arrow be visible".
-  const g = coach.guidance;
+  const g = positionConfirmed ? coach.guidance : null;
   if (g && tracker.H) drawMove(tracker.H, g);
   ctx.restore();
 }
@@ -769,6 +785,32 @@ function resetPositionEditor() {
   paintPositionBoard();
 }
 
+function populatePositionFromGame() {
+  const rows = game.board();
+  POSITION_PIECES.fill('');
+  activePiece = '';
+  activeSquare = -1;
+  for (let row = 0; row < 8; row++) {
+    for (let file = 0; file < 8; file++) {
+      const piece = rows[row][file];
+      if (piece) {
+        const code = piece.type.toUpperCase();
+        POSITION_PIECES[(7 - row) * 8 + file] = piece.color === 'w' ? code : code.toLowerCase();
+      }
+    }
+  }
+  const fields = game.fen().split(' ');
+  document.getElementById('positionTurn').value = fields[1];
+  document.getElementById('positionEp').value = fields[3] === '-' ? '' : fields[3];
+  document.querySelectorAll('[data-castle]').forEach((el) => {
+    el.checked = fields[2].includes(el.dataset.castle);
+  });
+  document.querySelectorAll('#piecePalette button').forEach((el) => {
+    el.setAttribute('aria-pressed', el.dataset.piece === '');
+  });
+  paintPositionBoard();
+}
+
 function populateStartingPosition() {
   const back = ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'];
   for (let file = 0; file < 8; file++) {
@@ -895,15 +937,8 @@ function initializeLabeler() {
   }
   paintPositionBoard();
 
-  document.getElementById('labelPosition').addEventListener('click', async () => {
-    resetPositionEditor();
-    positionDialog.showModal();
-    try {
-      const records = await getLabelRecords();
-      setLabelMessage(`${records.length} locally saved labeled position${records.length === 1 ? '' : 's'}. No images are uploaded.`);
-    } catch (err) {
-      setLabelMessage(`Local label storage unavailable: ${err.message}`, 'bad');
-    }
+  document.getElementById('labelPosition').addEventListener('click', () => {
+    openPositionEditor({ useKnownPosition: positionConfirmed });
   });
   document.getElementById('labelStart').addEventListener('click', populateStartingPosition);
   document.getElementById('labelCancel').addEventListener('click', () => positionDialog.close());
@@ -932,6 +967,8 @@ function initializeLabeler() {
       sampler.reset();
       lastDesc = null;
       desynced = false;
+      positionConfirmed = true;
+      positionPrompted = true;
       thinkingSince = 0;
       lastAsk = 0;
       engineRetryAt = 0;
@@ -970,6 +1007,19 @@ function initializeLabeler() {
   });
 }
 
+function openPositionEditor({ useKnownPosition }) {
+  if (positionDialog.open) return;
+  if (useKnownPosition) populatePositionFromGame();
+  else resetPositionEditor();
+  positionPrompted = true;
+  positionDialog.showModal();
+  getLabelRecords().then((records) => {
+    setLabelMessage(`${records.length} locally saved labeled position${records.length === 1 ? '' : 's'}. No images are uploaded.`);
+  }).catch((err) => {
+    setLabelMessage(`Local label storage unavailable: ${err.message}`, 'bad');
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* controls                                                            */
 /* ------------------------------------------------------------------ */
@@ -1002,13 +1052,20 @@ sideSel.addEventListener('change', () => {
 document.getElementById('resync').addEventListener('click', () => {
   stopSearchWorker();
   coach.reset();
+  positionConfirmed = DEMO;
+  positionPrompted = DEMO;
   reader = new MoveReader();
   lastDesc = null;
   sampler.reset();
   desynced = false;
   syncDemo();
-  setStatus('Reset to the start position', 'ok');
-  askEngine();
+  if (DEMO) {
+    setStatus('Reset to the start position', 'ok');
+    askEngine();
+  } else {
+    setStatus('Confirm the physical board position before analysis', '');
+    if (tracker.H) openPositionEditor({ useKnownPosition: false });
+  }
 });
 
 document.getElementById('undo').addEventListener('click', () => {

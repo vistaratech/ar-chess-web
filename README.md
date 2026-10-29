@@ -23,7 +23,8 @@ Live: <https://ar-chess-web.vercel.app>
   colour dropped. An arm lying across the board ruins the first and barely dents
   the second, so tracking stays glued while somebody moves pieces, and a move
   played *under* a resting hand is read as soon as the hand lifts.
-- **Reads the opponent's move.** After the board has been still for two frames,
+- **Tracks moves after position confirmation.** Once the board position has been
+  confirmed and synchronized, after the board has been still for two frames,
   the squares that changed appearance are matched against the legal moves of the
   current position, and the move is played in the app's own game state. The
   squares are sampled on a grid that is *kept* between frames and only moved when
@@ -51,7 +52,8 @@ Live: <https://ar-chess-web.vercel.app>
   of the table and names the squares accordingly. A suggestion is always produced
   when it is the selected side's turn: if a worker ever fails or stalls, the app
   restarts it and asks again instead of leaving the line blank.
-- **Confirm a current position.** Choose **Set position**, mark every occupied
+- **Confirm a current position.** On first use, after a missed move, or after
+  **Resync**, choose **Set position**, mark every occupied
   square with its piece, and confirm the side to move, castling rights, and
   en-passant square. The app validates the resulting position before searching;
   it only recommends a move when the selected side is actually to move.
@@ -94,18 +96,19 @@ a desktop.
   an edge is fine (6/6 poses in the test suite), but if half the board is covered
   at the moment the camera opens the app keeps searching until it can see enough
   of it. Once locked, covering the board does not drop the lock.
-- In the legacy move-tracking flow, pieces are detected as *changed squares*, not identified. A move is only
+- In move tracking, pieces are detected as *changed squares*, not identified. A move is only
   reported when the change set matches exactly one legal move well enough. A hand
   crossing the board is not treated as a move and does not throw away the
   reference either: the app shows "Hand over the board — waiting for a clear view"
   and reads the move underneath it when the board is clear. (If a large change
-  stays put for a few seconds it is taken as a new position and the app asks for a
-  resync instead, so it cannot wait forever.)
+  stays put for a few seconds it is treated as an unreadable position and the app
+  asks you to enter the current board.)
 - **A move the app cannot read drops the arrow instead of keeping it.** If the
   board changes in a way no legal move explains — a piece knocked over, a move
   played out of turn, a mistake earlier in the game — the recommendation is
-  discarded and the app says "Could not read that move — tap Resync". It does not
-  re-suggest the same move for a board it can no longer account for. If the
+  discarded and the position editor opens with a blank board so the stale game
+  state cannot be mistaken for the physical position. The app does not re-suggest
+  the same move for a board it can no longer account for. If the
   recommendation is still legal and all of its squares are among those that
   changed, a single unrelated square also moving does not stop it being accepted
   as played.
@@ -113,7 +116,7 @@ a desktop.
   cannot check that the right piece landed on the destination — only that a legal
   move produces exactly this change set, and that it is the recommended one. A
   board whose position has already drifted from the app's game cannot be repaired
-  by reading; use **Resync**.
+  by changed-square tracking; enter its actual position with **Set position**.
 - The engine is a compact 0x88 search, not Stockfish. Its move generator is
   perft-exact and the search reaches depth 9–11 in the ~2 s budget, which is
   enough to see mates, hanging pieces and most short tactics. It is still a small
