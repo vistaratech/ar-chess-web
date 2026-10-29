@@ -34,7 +34,9 @@
     font: 600 15px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: #6fe3a6; min-height: 18px;
   }
-  #bar { display: flex; gap: 8px; align-items: stretch; }
+  #bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+  #bar button { flex: 0 0 auto; }
+  #labelPosition { flex: 1 1 100% !important; }
   button, select {
     font: inherit; color: #e8ecf1; background: #1b232c;
     border: 1px solid #2c3946; border-radius: 10px; padding: 9px 12px;
@@ -58,6 +60,40 @@
     color: #6b7a8a; text-transform: uppercase;
   }
   #title.show { display: none; }
+  dialog {
+    width: min(94vw, 520px); max-height: 92dvh; overflow: auto;
+    color: #e8ecf1; background: #10171e; border: 1px solid #344454;
+    border-radius: 16px; padding: 16px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.72); }
+  dialog h2 { margin: 0 0 6px; font-size: 18px; }
+  dialog p { margin: 0 0 12px; color: #b9c4d0; font-size: 13px; }
+  #labelBoard {
+    display: grid; grid-template-columns: repeat(8, 1fr);
+    width: min(72vw, 360px); aspect-ratio: 1; margin: 0 auto 12px;
+    border: 2px solid #667583;
+  }
+  .label-square {
+    min-width: 0; min-height: 0; padding: 0; border: 0; border-radius: 0;
+    display: grid; place-items: center; font-size: clamp(18px, 7vw, 34px);
+  }
+  .label-square.light { background: #e8dfc7; color: #18212a; }
+  .label-square.dark { background: #759568; color: #18212a; }
+  .label-square.selected { outline: 3px solid #40d6b6; outline-offset: -3px; }
+  #piecePalette {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 12px;
+  }
+  #piecePalette button { padding: 5px 2px; min-height: 38px; font-size: 20px; }
+  #piecePalette button[aria-pressed="true"] { border-color: #40d6b6; }
+  #positionFields, #castleFields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+  #positionFields label { display: grid; gap: 4px; color: #b9c4d0; font-size: 12px; }
+  #positionFields input, #positionFields select {
+    width: 100%; min-width: 0; color: #e8ecf1; background: #1b232c;
+    border: 1px solid #344454; border-radius: 8px; padding: 8px;
+  }
+  #labelActions { display: flex; flex-wrap: wrap; gap: 8px; }
+  #labelActions button { flex: 1 1 auto; }
+  #labelMessage { min-height: 18px; margin-top: 8px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -82,8 +118,40 @@
     <button id="resync" class="primary">Resync</button>
     <button id="undo">Undo</button>
     <button id="info" aria-label="Help">?</button>
+    <button id="labelPosition">Set position</button>
   </div>
 </div>
+
+<dialog id="positionDialog">
+  <h2>Confirm the board position</h2>
+  <p>Piece recognition is not installed yet. Mark the pieces below to confirm this camera view. Square images and labels are stored only in this browser.</p>
+  <div id="labelBoard" role="group" aria-label="Chessboard position editor"></div>
+  <div id="piecePalette" role="group" aria-label="Choose a piece to place"></div>
+  <div id="positionFields">
+    <label>Side to move
+      <select id="positionTurn">
+        <option value="w">White</option><option value="b">Black</option>
+      </select>
+    </label>
+    <label>En passant square (if any)
+      <input id="positionEp" type="text" maxlength="2" placeholder="—">
+    </label>
+  </div>
+  <p>Castling rights</p>
+  <div id="castleFields">
+    <label><span><input type="checkbox" data-castle="K"> White king side</span></label>
+    <label><span><input type="checkbox" data-castle="Q"> White queen side</span></label>
+    <label><span><input type="checkbox" data-castle="k"> Black king side</span></label>
+    <label><span><input type="checkbox" data-castle="q"> Black queen side</span></label>
+  </div>
+  <div id="labelActions">
+    <button id="labelStart">Starting position</button>
+    <button id="labelCancel">Cancel</button>
+    <button id="labelExport">Export labeled data</button>
+    <button id="labelAnalyze" class="primary">Save position & analyze</button>
+  </div>
+  <div id="labelMessage" role="status" aria-live="polite"></div>
+</dialog>
 
 <script type="module" src="./js/app.js"></script>
 </body>

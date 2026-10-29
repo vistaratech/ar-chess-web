@@ -1,8 +1,8 @@
 # AR Chess
 
-Point a phone at a real chessboard. The board is found and tracked automatically —
-no calibration taps — the opponent's move is read off the board, and the engine's
-best reply is drawn on the board as an arrow. Play the arrow and it disappears.
+Point a phone at a chessboard. The board is found and tracked automatically. You
+can confirm a position square by square, analyze it, and save labeled square
+images locally for future piece-recognition work.
 
 Live: <https://ar-chess-web.vercel.app>
 
@@ -51,19 +51,29 @@ Live: <https://ar-chess-web.vercel.app>
   of the table and names the squares accordingly. A suggestion is always produced
   when it is the selected side's turn: if a worker ever fails or stalls, the app
   restarts it and asks again instead of leaving the line blank.
+- **Confirm a current position.** Choose **Set position**, mark every occupied
+  square with its piece, and confirm the side to move, castling rights, and
+  en-passant square. The app validates the resulting position before searching;
+  it only recommends a move when the selected side is actually to move.
+- **Build a local recognition dataset.** Confirming a position saves one rectified
+  48×48 image and its piece label for each square in this browser's IndexedDB.
+  Use **Export labeled data** to download the samples. Images are not uploaded.
 
 Demo without a camera: **`?demo=1`** renders a synthetic board that plays both
 sides. The opponent's replies are scripted; your side plays exactly the move the
 arrow shows, so the whole read → recommend → verify → clear loop can be watched on
 a desktop.
 
-## Honest limits
+## Recognition status and limits
 
-- The app reads **moves**, not positions. It starts from the initial position and
-  keeps its own game state in step by watching which squares change. Pointing it
-  at a random mid-game board and expecting the position to be recognised does not
-  work: that needs a trained piece-recognition model, which this project does not
-  ship. Use **Resync** to return to the start position.
+- **Automatic piece recognition is not implemented.** The camera finds the board
+  and rectifies its squares, but it does not identify piece type or color. Use
+  **Set position** to enter and verify all 64 squares. The labeled captures are a
+  data-collection workflow, not a trained model; exported data must be used to
+  train and validate one before hands-free position recognition is possible.
+- A still board does not encode whose turn it is, castling rights, or an
+  en-passant target. Confirm these in the position editor. The app will not search
+  when it is not the selected player's turn.
 - Detection is a classical computer-vision pipeline (Hough lines, pyramid,
   colour-parity scoring, ridge snapping), not a neural network. It is reliable for
   a visible board with reasonable contrast and light; it can fail on heavy clutter
@@ -84,7 +94,7 @@ a desktop.
   an edge is fine (6/6 poses in the test suite), but if half the board is covered
   at the moment the camera opens the app keeps searching until it can see enough
   of it. Once locked, covering the board does not drop the lock.
-- Pieces are detected as *changed squares*, not identified. A move is only
+- In the legacy move-tracking flow, pieces are detected as *changed squares*, not identified. A move is only
   reported when the change set matches exactly one legal move well enough. A hand
   crossing the board is not treated as a move and does not throw away the
   reference either: the app shows "Hand over the board — waiting for a clear view"

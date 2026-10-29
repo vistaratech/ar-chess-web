@@ -30,6 +30,7 @@ const dot = document.getElementById('dot');
 const bestEl = document.getElementById('best');
 const hintEl = document.getElementById('hint');
 const sideSel = document.getElementById('side');
+const positionDialog = document.getElementById('positionDialog');
 
 /** The side the player chose last time. White is the default: the coach is
  * most useful to the person moving up the board, and the request that led here
@@ -81,11 +82,14 @@ let engineError = '';
 function startWorker() {
   if (worker) return;
   try {
-    worker = new Worker('./js/engine.js', { type: 'module' });
-    worker.onmessage = (e) => {
+    const instance = new Worker('./js/engine.js', { type: 'module' });
+    worker = instance;
+    instance.onmessage = (e) => {
+      if (worker !== instance) return;
       const m = e.data || {};
       if (m.type === 'error') {
-        if (m.id === coach.req) coach.thinking = false;
+        if (m.id !== coach.req) return;
+        coach.thinking = false;
         engineError = m.error || 'engine error';
         engineRetryAt = performance.now() + ENGINE_RETRY_MS;
         showBest();
@@ -103,8 +107,9 @@ function startWorker() {
       }
       if (live) showBest();
     };
-    worker.onerror = () => {
-      try { worker.terminate(); } catch { /* already gone */ }
+    instance.onerror = () => {
+      if (worker !== instance) return;
+      try { instance.terminate(); } catch { /* already gone */ }
       worker = null;
       coach.thinking = false;
       engineRetryAt = performance.now() + ENGINE_RETRY_MS;
@@ -116,6 +121,15 @@ function startWorker() {
     engineRetryAt = performance.now() + ENGINE_RETRY_MS;
     engineError = 'engine unavailable';
   }
+}
+
+function stopSearchWorker() {
+  if (worker) {
+    try { worker.terminate(); } catch { /* already gone */ }
+    worker = null;
+  }
+  coach.thinking = false;
+  thinkingSince = 0;
 }
 
 function describeSuggestion(s) {
@@ -156,10 +170,13 @@ function askEngine() {
   showBest();
   if (!req) return;
   if (!worker) {
-    coach.thinking = false;
-    engineRetryAt = performance.now() + ENGINE_RETRY_MS;
-    showBest();
-    return;
+    startWorker();
+    if (!worker) {
+      coach.thinking = false;
+      engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+      showBest();
+      return;
+    }
   }
   thinkingSince = performance.now();
   lastAsk = thinkingSince;
@@ -299,7 +316,7 @@ async function startDemo() {
  * "recommend, then clear the arrow as soon as it is played" end to end.
  */
 function maybeStepDemo(now) {
-  if (!demo || now < demo.next) return;
+  if (!demo || positionDialog.open || now < demo.next) return;
   const live = coach.game;
   if (live.game_over() || demo.plays >= 60) return;
 
@@ -399,15 +416,17 @@ function step(now) {
       desc = sampler.see(res.prepared, vw, vh, res);
       lastDesc = desc;
     }
-    const r = reader.push(desc, { gridMoved: res.gridMoved, now: performance.now() });
-    occluded = !!r.implausible;
-    if (r.settled || r.stuck) readBoard(desc, r);
-    else if (!r.changed.size && sampler.drift(res) > 0.04) {
-      // Nothing is changing, so the reference can follow the board: move the
-      // sampling grid onto the squares it is sampling and re-base from there.
-      // Doing this while a change is pending would throw that change away.
-      lastDesc = sampler.refresh(res.prepared, vw, vh, res);
-      reader.commit(lastDesc);
+    if (!positionDialog.open) {
+      const r = reader.push(desc, { gridMoved: res.gridMoved, now: performance.now() });
+      occluded = !!r.implausible;
+      if (r.settled || r.stuck) readBoard(desc, r);
+      else if (!r.changed.size && sampler.drift(res) > 0.04) {
+        // Nothing is changing, so the reference can follow the board: move the
+        // sampling grid onto the squares it is sampling and re-base from there.
+        // Doing this while a change is pending would throw that change away.
+        lastDesc = sampler.refresh(res.prepared, vw, vh, res);
+        reader.commit(lastDesc);
+      }
     }
   } else {
     lastDesc = null;
@@ -454,7 +473,13 @@ function readBoard(desc, r) {
     return;
   }
 
+  const wasThinking = coach.thinking;
   const out = coach.read(r.changed);
+  if (wasThinking && worker) {
+    // A worker search is synchronous, so a newer request would otherwise wait
+    // behind a search for the position that has just changed.
+    stopSearchWorker();
+  }
   reader.commit(desc);
 
   if (out.accepted) {
@@ -644,11 +669,314 @@ function ringSquare(H, square) {
 }
 
 /* ------------------------------------------------------------------ */
+/* position confirmation and local training samples                    */
+/* ------------------------------------------------------------------ */
+
+const LABEL_DB = 'ar-chess-position-labels';
+const LABEL_STORE = 'positions';
+const POSITION_PIECES = new Array(64).fill('');
+const PIECES = [
+  ['', '·', 'Empty'], ['K', '♔', 'White king'], ['Q', '♕', 'White queen'],
+  ['R', '♖', 'White rook'], ['B', '♗', 'White bishop'], ['N', '♘', 'White knight'],
+  ['P', '♙', 'White pawn'], ['k', '♚', 'Black king'], ['q', '♛', 'Black queen'],
+  ['r', '♜', 'Black rook'], ['b', '♝', 'Black bishop'], ['n', '♞', 'Black knight'],
+  ['p', '♟', 'Black pawn'],
+];
+let activePiece = '';
+let activeSquare = -1;
+
+function openLabelDatabase() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('Local browser storage is unavailable'));
+      return;
+    }
+    const request = indexedDB.open(LABEL_DB, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LABEL_STORE)) {
+        db.createObjectStore(LABEL_STORE, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Could not open local label storage'));
+  });
+}
+
+async function saveLabelRecord(record) {
+  const db = await openLabelDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LABEL_STORE, 'readwrite');
+    tx.objectStore(LABEL_STORE).put(record);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error('Could not save this labeled position')); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error('Saving this labeled position was cancelled')); };
+  });
+}
+
+async function getLabelRecords() {
+  const db = await openLabelDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LABEL_STORE, 'readonly');
+    const request = tx.objectStore(LABEL_STORE).getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Could not read local label data'));
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => { db.close(); reject(tx.error || new Error('Could not read local label data')); };
+  });
+}
+
+function setLabelMessage(text, tone = '') {
+  const el = document.getElementById('labelMessage');
+  el.textContent = text;
+  el.style.color = tone === 'bad' ? '#ff8b8b' : '#b9c4d0';
+}
+
+function paintPositionBoard() {
+  const board = document.getElementById('labelBoard');
+  board.replaceChildren();
+  for (let rank = 7; rank >= 0; rank--) {
+    for (let file = 0; file < 8; file++) {
+      const index = rank * 8 + file;
+      const piece = PIECES.find(([code]) => code === POSITION_PIECES[index]);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `label-square ${(rank + file) % 2 ? 'dark' : 'light'}`;
+      if (index === activeSquare) button.classList.add('selected');
+      button.textContent = piece ? piece[1] : '';
+      button.setAttribute('aria-label', `${'abcdefgh'[file]}${rank + 1}: ${piece ? piece[2] : 'empty'}`);
+      button.dataset.index = String(index);
+      button.addEventListener('click', () => {
+        POSITION_PIECES[index] = activePiece;
+        activeSquare = index;
+        paintPositionBoard();
+      });
+      board.append(button);
+    }
+  }
+}
+
+function resetPositionEditor() {
+  POSITION_PIECES.fill('');
+  activePiece = '';
+  activeSquare = -1;
+  document.getElementById('positionTurn').value = coach.side;
+  document.getElementById('positionEp').value = '';
+  document.querySelectorAll('[data-castle]').forEach((el) => { el.checked = false; });
+  document.querySelectorAll('#piecePalette button').forEach((el) => {
+    el.setAttribute('aria-pressed', el.dataset.piece === '');
+  });
+  paintPositionBoard();
+}
+
+function populateStartingPosition() {
+  const back = ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'];
+  for (let file = 0; file < 8; file++) {
+    POSITION_PIECES[file] = back[file];
+    POSITION_PIECES[8 + file] = 'P';
+    POSITION_PIECES[48 + file] = 'p';
+    POSITION_PIECES[56 + file] = back[file].toLowerCase();
+  }
+  document.getElementById('positionTurn').value = 'w';
+  document.querySelectorAll('[data-castle]').forEach((el) => { el.checked = true; });
+  paintPositionBoard();
+}
+
+function buildPositionFen() {
+  const ranks = [];
+  for (let rank = 7; rank >= 0; rank--) {
+    let row = '', empty = 0;
+    for (let file = 0; file < 8; file++) {
+      const piece = POSITION_PIECES[rank * 8 + file];
+      if (piece) {
+        if (empty) row += empty;
+        row += piece;
+        empty = 0;
+      } else {
+        empty++;
+      }
+    }
+    if (empty) row += empty;
+    ranks.push(row);
+  }
+  const turn = document.getElementById('positionTurn').value;
+  const rights = Array.from(document.querySelectorAll('[data-castle]:checked'))
+    .map((el) => el.dataset.castle).join('') || '-';
+  const ep = document.getElementById('positionEp').value.trim() || '-';
+  if (ep !== '-' && !/^[a-h][36]$/.test(ep)) {
+    throw new Error('Enter a valid en passant square, or leave it blank');
+  }
+  return `${ranks.join('/')} ${turn} ${rights} ${ep} 0 1`;
+}
+
+function captureBoardSamples(fen) {
+  if (!tracker.H) throw new Error('Keep the whole board visible until it is detected');
+  const source = document.createElement('canvas');
+  source.width = vw;
+  source.height = vh;
+  const sourceCtx = source.getContext('2d', { willReadFrequently: true });
+  if (DEMO && demo) {
+    demo.scene.renderScene(sourceCtx, {
+      w: vw, h: vh, fen, quad: demo.quad, border: 0.02, light: 0.05, noise: 0, seed: 7,
+    });
+  } else {
+    if (video.readyState < 2) throw new Error('Camera frame is not ready yet');
+    sourceCtx.drawImage(video, 0, 0, vw, vh);
+  }
+  const frame = sourceCtx.getImageData(0, 0, vw, vh).data;
+  const size = 48;
+  const samples = [];
+
+  for (let rank = 0; rank < 8; rank++) {
+    for (let file = 0; file < 8; file++) {
+      const corners = [
+        project(tracker.H, file + 0.08, rank + 0.08),
+        project(tracker.H, file + 0.92, rank + 0.08),
+        project(tracker.H, file + 0.08, rank + 0.92),
+        project(tracker.H, file + 0.92, rank + 0.92),
+      ];
+      if (corners.some((p) => !p)) throw new Error('Could not sample every board square');
+      const [a, b, c, d] = corners;
+      const image = document.createElement('canvas');
+      image.width = size;
+      image.height = size;
+      const imageCtx = image.getContext('2d');
+      const pixels = imageCtx.createImageData(size, size);
+      for (let y = 0; y < size; y++) {
+        const v = y / (size - 1);
+        for (let x = 0; x < size; x++) {
+          const u = x / (size - 1);
+          const px = (1 - u) * (1 - v) * a[0] + u * (1 - v) * b[0] + (1 - u) * v * c[0] + u * v * d[0];
+          const py = (1 - u) * (1 - v) * a[1] + u * (1 - v) * b[1] + (1 - u) * v * c[1] + u * v * d[1];
+          if (px < 0 || py < 0 || px >= vw || py >= vh) throw new Error('Board extends outside the camera frame');
+          const x0 = Math.floor(px), y0 = Math.floor(py);
+          const x1 = Math.min(vw - 1, x0 + 1), y1 = Math.min(vh - 1, y0 + 1);
+          const fx = px - x0, fy = py - y0;
+          const out = (y * size + x) * 4;
+          for (let channel = 0; channel < 3; channel++) {
+            const p00 = frame[(y0 * vw + x0) * 4 + channel];
+            const p10 = frame[(y0 * vw + x1) * 4 + channel];
+            const p01 = frame[(y1 * vw + x0) * 4 + channel];
+            const p11 = frame[(y1 * vw + x1) * 4 + channel];
+            pixels.data[out + channel] =
+              (p00 * (1 - fx) + p10 * fx) * (1 - fy) + (p01 * (1 - fx) + p11 * fx) * fy;
+          }
+          pixels.data[out + 3] = 255;
+        }
+      }
+      imageCtx.putImageData(pixels, 0, 0);
+      samples.push({
+        square: `${'abcdefgh'[file]}${rank + 1}`,
+        piece: POSITION_PIECES[rank * 8 + file],
+        image: image.toDataURL('image/jpeg', 0.82),
+      });
+    }
+  }
+  return samples;
+}
+
+function initializeLabeler() {
+  const palette = document.getElementById('piecePalette');
+  for (const [code, glyph, name] of PIECES) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = glyph;
+    button.title = name;
+    button.setAttribute('aria-label', name);
+    button.dataset.piece = code;
+    button.setAttribute('aria-pressed', String(code === ''));
+    button.addEventListener('click', () => {
+      activePiece = code;
+      palette.querySelectorAll('button').forEach((el) => {
+        el.setAttribute('aria-pressed', String(el.dataset.piece === code));
+      });
+    });
+    palette.append(button);
+  }
+  paintPositionBoard();
+
+  document.getElementById('labelPosition').addEventListener('click', async () => {
+    resetPositionEditor();
+    positionDialog.showModal();
+    try {
+      const records = await getLabelRecords();
+      setLabelMessage(`${records.length} locally saved labeled position${records.length === 1 ? '' : 's'}. No images are uploaded.`);
+    } catch (err) {
+      setLabelMessage(`Local label storage unavailable: ${err.message}`, 'bad');
+    }
+  });
+  document.getElementById('labelStart').addEventListener('click', populateStartingPosition);
+  document.getElementById('labelCancel').addEventListener('click', () => positionDialog.close());
+
+  document.getElementById('labelAnalyze').addEventListener('click', async () => {
+    try {
+      const fen = buildPositionFen();
+      const confirmed = new Chess();
+      confirmed.load(fen);
+      if (confirmed.game_over()) throw new Error('This position has no legal move to analyze');
+      const samples = captureBoardSamples(fen);
+      const record = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        createdAt: new Date().toISOString(),
+        fen,
+        playerSide: coach.side,
+        squares: samples,
+      };
+      await saveLabelRecord(record);
+
+      stopSearchWorker();
+      game.load(fen);
+      syncDemo();
+      coach.drop();
+      reader = new MoveReader();
+      sampler.reset();
+      lastDesc = null;
+      desynced = false;
+      thinkingSince = 0;
+      lastAsk = 0;
+      engineRetryAt = 0;
+      engineError = '';
+      positionDialog.close();
+      if (coach.myTurn) {
+        setStatus('Position confirmed — analyzing', 'ok');
+        askEngine();
+      } else {
+        setStatus(`Position confirmed — ${coach.opponentName} to move`, 'ok');
+        showBest();
+      }
+    } catch (err) {
+      setLabelMessage(`Please correct the position: ${err.message}`, 'bad');
+    }
+  });
+
+  document.getElementById('labelExport').addEventListener('click', async () => {
+    try {
+      const records = await getLabelRecords();
+      if (!records.length) {
+        setLabelMessage('No labeled positions to export yet.');
+        return;
+      }
+      const blob = new Blob([JSON.stringify({ version: 1, records })], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'ar-chess-labeled-positions.json';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setLabelMessage(`Exported ${records.length} labeled position${records.length === 1 ? '' : 's'}.`);
+    } catch (err) {
+      setLabelMessage(`Could not export local labels: ${err.message}`, 'bad');
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* controls                                                            */
 /* ------------------------------------------------------------------ */
 
 sideSel.addEventListener('change', () => {
   const side = sideSel.value;
+  stopSearchWorker();
   try { localStorage.setItem(SIDE_KEY, side); } catch { /* private mode */ }
   tracker = new BoardTracker({ side });
   coach.setSide(side);
@@ -672,6 +1000,7 @@ sideSel.addEventListener('change', () => {
 });
 
 document.getElementById('resync').addEventListener('click', () => {
+  stopSearchWorker();
   coach.reset();
   reader = new MoveReader();
   lastDesc = null;
@@ -683,6 +1012,7 @@ document.getElementById('resync').addEventListener('click', () => {
 });
 
 document.getElementById('undo').addEventListener('click', () => {
+  if (game.history().length) stopSearchWorker();
   if (coach.undo()) {
     reader = new MoveReader();
     lastDesc = null;
@@ -699,13 +1029,14 @@ document.getElementById('info').addEventListener('click', () => {
   document.getElementById('title').classList.toggle('show', !open);
   if (!open) return;
   document.getElementById('hintExtra').innerHTML =
-    'Reads moves from the <b>starting position</b>: it watches which squares change and ' +
-    'matches that against the legal moves, so it works for a game played from the start ' +
-    'in one session. It cannot read an arbitrary mid-game position off a photo — that ' +
-    'needs a piece-recognition model this page does not ship. Use <b>Resync</b> to start again.';
+    'Use <b>Set position</b> to confirm every piece and whose turn it is. The app searches ' +
+    'only after the position is validated, and saves rectified square images with your ' +
+    'labels locally for future recognition work. Automatic piece recognition is not ' +
+    'available yet; no board images are uploaded.';
 });
 
 start();
+initializeLabeler();
 
 /* Small introspection hook, handy from the console and for automated checks. */
 window.__ar = () => ({
