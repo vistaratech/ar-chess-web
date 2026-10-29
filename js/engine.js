@@ -1,237 +1,129 @@
 /*
- * engine.js — chess search running in a module worker.
+ * engine.js — the module worker the page talks to.
  *
- * Alpha-beta with iterative deepening, MVV-LVA move ordering and a quiescence
- * search over captures, so the score it returns is not thrown off by a piece
- * hanging at the horizon. Deliberately small: this has to answer in well under
- * a second on a phone while the camera loop is running in the page.
+ * The search itself lives in engine-search.js (with the board in
+ * engine-board.js and the evaluation in engine-eval.js). This file is only the
+ * boundary: it turns the chosen 0x88 move into SAN with chess.js, verifies that
+ * chess.js agrees the move is legal, and posts the protocol messages.
+ *
+ * Using chess.js for the last step is deliberate. The fast generator has been
+ * perft-checked, but a coach that draws an illegal arrow is worse than a slow
+ * one, so the engine's answer is always cross-checked against a second, trusted
+ * move generator. If they ever disagree the page gets a legal move instead.
  *
  * Protocol
- *   in : { type: 'think', id, fen, ms }  ms = time budget, default 1200
+ *   in : { type: 'think', id, fen, ms, maxDepth? }   ms = time budget
  *   out: { type: 'best', id, fen, from, to, promotion, san, score, depth, nodes, pv }
- *        { type: 'info', depth, score, nodes }   after each completed depth
+ *        { type: 'info', id, depth, score, nodes, pv }   after each depth
+ *        { type: 'error', id, fen, error }
  *
- * `id` is echoed on every reply so the page can throw away an answer to a
+ * `id` is echoed on every reply so the page can throw away an answer for a
  * position it has already left (the user moved while the engine was thinking).
  */
 
 import { Chess } from '../vendor/chess.js';
+import { searchPosition } from './engine-search.js';
 
-const VALUE = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 0 };
-const MATE = 100000;
+const PROMO = ['', '', 'n', 'b', 'r', 'q'];
 
-/* Piece-square tables, written from White's point of view with rank 8 first
-   (the same order chess.js uses in `board()`), so no flipping is needed. */
-const PST = {
-  p: [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    50, 50, 50, 50, 50, 50, 50, 50,
-    10, 10, 20, 30, 30, 20, 10, 10,
-    5, 5, 10, 25, 25, 10, 5, 5,
-    0, 0, 0, 20, 20, 0, 0, 0,
-    5, -5, -10, 0, 0, -10, -5, 5,
-    5, 10, 10, -20, -20, 10, 10, 5,
-    0, 0, 0, 0, 0, 0, 0, 0,
-  ],
-  n: [
-    -50, -40, -30, -30, -30, -30, -40, -50,
-    -40, -20, 0, 0, 0, 0, -20, -40,
-    -30, 0, 10, 15, 15, 10, 0, -30,
-    -30, 5, 15, 20, 20, 15, 5, -30,
-    -30, 0, 15, 20, 20, 15, 0, -30,
-    -30, 5, 10, 15, 15, 10, 5, -30,
-    -40, -20, 0, 5, 5, 0, -20, -40,
-    -50, -40, -30, -30, -30, -30, -40, -50,
-  ],
-  b: [
-    -20, -10, -10, -10, -10, -10, -10, -20,
-    -10, 0, 0, 0, 0, 0, 0, -10,
-    -10, 0, 5, 10, 10, 5, 0, -10,
-    -10, 5, 5, 10, 10, 5, 5, -10,
-    -10, 0, 10, 10, 10, 10, 0, -10,
-    -10, 10, 10, 10, 10, 10, 10, -10,
-    -10, 5, 0, 0, 0, 0, 5, -10,
-    -20, -10, -10, -10, -10, -10, -10, -20,
-  ],
-  r: [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    5, 10, 10, 10, 10, 10, 10, 5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    0, 0, 0, 5, 5, 0, 0, 0,
-  ],
-  q: [
-    -20, -10, -10, -5, -5, -10, -10, -20,
-    -10, 0, 0, 0, 0, 0, 0, -10,
-    -10, 0, 5, 5, 5, 5, 0, -10,
-    -5, 0, 5, 5, 5, 5, 0, -5,
-    0, 0, 5, 5, 5, 5, 0, -5,
-    -10, 5, 5, 5, 5, 5, 0, -10,
-    -10, 0, 5, 0, 0, 0, 0, -10,
-    -20, -10, -10, -5, -5, -10, -10, -20,
-  ],
-  k: [
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -20, -30, -30, -40, -40, -30, -30, -20,
-    -10, -20, -20, -20, -20, -20, -20, -10,
-    20, 20, 0, 0, 0, 0, 20, 20,
-    20, 30, 10, 0, 0, 10, 30, 20,
-  ],
-};
-
-/* Mirrored table index for Black, whose board rows run the other way. */
-function pstIndex(type, color, row, col) {
-  return color === 'w' ? row * 8 + col : (7 - row) * 8 + col;
+function nameOf(sq) {
+  return 'abcdefgh'[sq & 7] + ((sq >> 4) + 1);
 }
 
-function evaluate(game) {
-  const board = game.board();
-  let score = 0;
-  for (let row = 0; row < 8; row++) {
-    for (let col = 0; col < 8; col++) {
-      const sq = board[row][col];
-      if (!sq) continue;
-      const base = VALUE[sq.type] + PST[sq.type][pstIndex(sq.type, sq.color, row, col)];
-      score += sq.color === 'w' ? base : -base;
-    }
-  }
-  return game.turn() === 'w' ? score : -score;
-}
-
-let nodes = 0;
-let deadline = 0;
-let aborted = false;
-
-function timeUp() {
-  if ((nodes & 511) === 0 && performance.now() > deadline) aborted = true;
-  return aborted;
-}
-
-/** Captures first, biggest victim taken by the cheapest attacker. */
-function orderMoves(moves) {
-  const scored = moves.map((m) => {
-    let s = 0;
-    if (m.captured) s += 1000 + VALUE[m.captured] - VALUE[m.piece] / 10;
-    if (m.promotion) s += 800 + VALUE[m.promotion];
-    if (m.san.includes('#')) s += 5000;
-    else if (m.san.includes('+')) s += 60;
-    return { m, s };
-  });
-  scored.sort((a, b) => b.s - a.s);
-  return scored.map((x) => x.m);
-}
-
-function quiesce(game, alpha, beta, ply) {
-  nodes++;
-  if (timeUp()) return alpha;
-  const stand = evaluate(game);
-  if (stand >= beta) return beta;
-  if (stand > alpha) alpha = stand;
-
-  const caps = game.moves({ verbose: true }).filter((m) => m.captured || m.promotion);
-  if (!caps.length) return alpha;
-
-  for (const m of orderMoves(caps)) {
-    game.move(m);
-    const v = -quiesce(game, -beta, -alpha, ply + 1);
-    game.undo();
-    if (aborted) return alpha;
-    if (v >= beta) return beta;
-    if (v > alpha) alpha = v;
-  }
-  return alpha;
-}
-
-function search(game, depth, alpha, beta, ply) {
-  nodes++;
-  if (timeUp()) return alpha;
-
-  const moves = game.moves({ verbose: true });
-  if (!moves.length) return game.in_check() ? -MATE + ply : 0;
-  if (depth <= 0) return quiesce(game, alpha, beta, ply);
-
-  let best = alpha;
-  for (const m of orderMoves(moves)) {
-    game.move(m);
-    const v = -search(game, depth - 1, -beta, -best, ply + 1);
-    game.undo();
-    if (aborted) return best;
-    if (v > best) {
-      best = v;
-      if (v >= beta) break;
-    }
-  }
-  return best;
-}
-
-/** One full root pass; returns the best move and its score. */
-function rootSearch(game, depth) {
-  const moves = orderMoves(game.moves({ verbose: true }));
-  let best = null, bestScore = -Infinity;
-  for (const m of moves) {
-    game.move(m);
-    // alpha = -Infinity, beta = -bestScore: later moves only need to prove they
-    // are worse than the current leader
-    const v = -search(game, depth - 1, -Infinity, -bestScore, 1);
-    game.undo();
-    if (aborted) break;
-    if (v > bestScore) {
-      bestScore = v;
-      best = m;
-    }
-  }
-  return { best, score: bestScore };
-}
-
-self.onmessage = (e) => {
-  const msg = e.data;
-  if (msg.type !== 'think') return;
+/**
+ * Search a FEN and return the move in both 0x88 and SAN form.
+ *
+ * Exported so tests can drive the engine directly in Node or the browser
+ * without going through the worker.
+ */
+export function analyze(fen, { ms = 1800, maxDepth = 64, onInfo = null } = {}) {
+  const result = searchPosition(fen, { ms, maxDepth, onInfo });
+  if (!result) return null;
 
   const game = new Chess();
   try {
-    game.load(msg.fen);
+    game.load(fen);
   } catch {
-    self.postMessage({ type: 'error', id: msg.id, fen: msg.fen, error: 'bad fen' });
-    return;
+    return null;
   }
 
-  const budget = msg.ms || 1200;
-  const start = performance.now();
-  deadline = start + budget;
-  nodes = 0;
-  aborted = false;
+  const legal = game.moves({ verbose: true });
+  if (!legal.length) return null;
 
-  let best = null, score = 0, reached = 0;
-  for (let depth = 1; depth <= (msg.maxDepth || 6); depth++) {
-    const r = rootSearch(game, depth);
-    if (r.best) { best = r.best; score = r.score; reached = depth; }
-    if (aborted) break;
-    self.postMessage({ type: 'info', depth, score, nodes });
-    // only start another ply if the budget is likely to cover it
-    const spent = performance.now() - start;
-    if (spent > budget * 0.45) break;
-  }
+  const from = nameOf(result.from);
+  const to = nameOf(result.to);
+  const promo = result.promotion ? PROMO[result.promotion] : null;
+  let move = legal.find((m) =>
+    m.from === from && m.to === to && (!promo || m.promotion === promo));
 
-  if (!best) {
-    self.postMessage({ type: 'best', id: msg.id, fen: msg.fen, from: null, to: null, score: 0, depth: 0, nodes });
-    return;
-  }
-  self.postMessage({
-    type: 'best',
-    id: msg.id,
-    fen: msg.fen,
-    from: best.from,
-    to: best.to,
-    promotion: best.promotion || null,
-    san: best.san,
-    score,
-    depth: reached,
-    nodes,
-  });
-};
+  // A second generator gets the last word. This branch should be unreachable;
+  // it exists so a generator bug can never put an illegal arrow on the board.
+  const agreed = !!move;
+  if (!move) move = legal[0];
+
+  return {
+    from: move.from,
+    to: move.to,
+    promotion: move.promotion || null,
+    san: move.san,
+    score: result.score,
+    depth: result.depth,
+    nodes: result.nodes,
+    pv: result.pv,
+    agreed,
+  };
+}
+
+/* The worker handler is installed only in a worker scope; importing this file
+ * in Node for tests must not throw. */
+if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
+  self.onmessage = (e) => {
+    const msg = e.data;
+    if (!msg || msg.type !== 'think') return;
+
+    try {
+      const best = analyze(msg.fen, {
+        ms: msg.ms || 1800,
+        maxDepth: msg.maxDepth || 64,
+        onInfo: (info) => self.postMessage({
+          type: 'info',
+          id: msg.id,
+          depth: info.depth,
+          score: info.score,
+          nodes: info.nodes,
+          pv: info.pv,
+        }),
+      });
+
+      if (!best) {
+        self.postMessage({
+          type: 'best', id: msg.id, fen: msg.fen,
+          from: null, to: null, promotion: null, san: '',
+          score: 0, depth: 0, nodes: 0, pv: [],
+        });
+        return;
+      }
+
+      self.postMessage({
+        type: 'best',
+        id: msg.id,
+        fen: msg.fen,
+        from: best.from,
+        to: best.to,
+        promotion: best.promotion,
+        san: best.san,
+        score: best.score,
+        depth: best.depth,
+        nodes: best.nodes,
+        pv: best.pv,
+      });
+    } catch (err) {
+      self.postMessage({
+        type: 'error',
+        id: msg.id,
+        fen: msg.fen,
+        error: String((err && err.message) || err || 'engine error'),
+      });
+    }
+  };
+}

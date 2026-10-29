@@ -1,34 +1,172 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>engine test</title>
-<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}pre{white-space:pre-wrap}</style>
+<style>body{background:#111;color:#ddd;font:12px ui-monospace,monospace;padding:12px}pre{white-space:pre-wrap}.ok{color:#5dd}.bad{color:#f77}</style>
 </head><body>
 <pre id="out">running…</pre>
 <script type="module">
+/*
+ * Engine sanity checks, driven through the real worker protocol.
+ *
+ * These are deliberately about behaviour a player would notice, not about
+ * implementation details: the answer must be a legal move, the engine must find
+ * a mate in one, it must take a hanging queen, it must reach a sensible depth
+ * inside the time budget, and it must answer for Black as readily as for White.
+ */
+import { Chess } from '../vendor/chess.js';
+
 const out = document.getElementById('out');
-const log = (s) => { out.textContent += '\n' + s; };
+out.textContent = '';
+const log = (s) => { out.textContent += s + '\n'; };
 
 const worker = new Worker('../js/engine.js', { type: 'module' });
+
 const cases = [
-  ['start', 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'],
-  ['mate in 1', '6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1'],
-  ['take the queen', 'rnb1kbnr/ppp2ppp/8/3q4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1'],
-  ['black to move', 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'],
+  {
+    name: 'start',
+    fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+    ms: 1500,
+    check: (r) => [
+      ['legal', r.legal],
+      ['reaches depth 6', r.depth >= 6],
+      ['is a White move', r.move.color === 'w'],
+      ['has a score', Number.isFinite(r.score)],
+    ],
+  },
+  {
+    name: 'mate in 1',
+    fen: '6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1',
+    ms: 800,
+    check: (r) => [
+      ['finds Re8#', r.move.san === 'Re8#'],
+      ['reports mate', r.score > 90000],
+    ],
+  },
+  {
+    name: 'back rank mate',
+    fen: '6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1',
+    ms: 800,
+    check: (r) => [
+      ['finds Ra8#', r.move.san === 'Ra8#'],
+      ['reports mate', r.score > 90000],
+    ],
+  },
+  {
+    name: 'take the queen',
+    fen: 'rnb1kbnr/ppp2ppp/8/3q4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1',
+    ms: 1500,
+    check: (r) => [
+      ['plays exd5', r.move.san === 'exd5'],
+      ['knows it is winning', r.score > 500],
+    ],
+  },
+  {
+    name: 'black to move',
+    fen: 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1',
+    ms: 1200,
+    check: (r) => [
+      ['legal', r.legal],
+      ['is a Black move', r.move.color === 'b'],
+      ['reaches depth 6', r.depth >= 6],
+    ],
+  },
+  {
+    name: 'quiet middlegame',
+    fen: 'r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 6',
+    ms: 1500,
+    check: (r) => [
+      ['legal', r.legal],
+      ['reaches depth 6', r.depth >= 6],
+      ['agrees with chess.js', r.agreed],
+    ],
+  },
 ];
 
 let i = 0;
-const next = () => {
-  if (i >= cases.length) { window.__done = true; return; }
-  const [name, fen] = cases[i++];
+let ok = 0;
+const total = () => cases.reduce((n, c) => n + c.check({ legal: true, depth: 99, move: { color: 'w', san: '' }, score: 0, agreed: true }).length, 0);
+const failures = [];
+
+function next() {
+  if (i >= cases.length) {
+    log('');
+    log(`engine: ${ok}/${total()} checks passed`);
+    window.__engine = { ok, total: total(), failures, done: true };
+    window.__done = true;
+    try { worker.terminate(); } catch { /* already gone */ }
+    return;
+  }
+
+  const c = cases[i++];
   const t0 = performance.now();
-  worker.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === 'info') { log(`  ${name} depth ${m.depth} score ${m.score} nodes ${m.nodes}`); return; }
-    if (m.type === 'best') {
-      log(`${name.padEnd(18)} ${m.san} (score ${m.score}, depth ${m.depth}, ${m.nodes} nodes, ${(performance.now() - t0).toFixed(0)} ms)`);
+  const id = 1000 + i;
+  let best = null;
+  let watchdog = 0;
+
+  const finish = () => {
+    clearTimeout(watchdog);
+    worker.onmessage = null;
+    if (!best) {
+      log(`${c.name.padEnd(18)} FAIL (no answer)`);
+      failures.push(`${c.name}: no answer`);
       next();
+      return;
+    }
+
+    const game = new Chess(c.fen);
+    const move = game.moves({ verbose: true }).find((m) =>
+      m.from === best.from && m.to === best.to &&
+      (m.promotion || null) === (best.promotion || null));
+
+    const r = {
+      move: move || { from: best.from, to: best.to, san: best.san, color: '?' },
+      legal: !!move,
+      score: best.score,
+      depth: best.depth,
+      agreed: !!best.agreed,
+    };
+    const checks = c.check(r);
+    let pass = 0;
+    for (const [label, good] of checks) {
+      if (good) pass++; else failures.push(`${c.name}: ${label}`);
+    }
+    ok += pass;
+    const details = checks.map(([label, good]) => `${good ? 'ok' : 'FAIL'} ${label}`).join(', ');
+    log(`${c.name.padEnd(18)} ${String(best.san).padEnd(6)} d${best.depth} ${best.nodes} nodes ` +
+        `${(performance.now() - t0).toFixed(0)}ms — ${details}`);
+    next();
+  };
+
+  worker.onmessage = (e) => {
+    const m = e.data || {};
+    if (m.id !== id) return;
+    if (m.type === 'info') {
+      log(`  ${c.name} info: depth ${m.depth} score ${m.score} nodes ${m.nodes}`);
+      return;
+    }
+    if (m.type === 'error') {
+      log(`${c.name.padEnd(18)} FAIL (${m.error})`);
+      failures.push(`${c.name}: ${m.error}`);
+      clearTimeout(watchdog);
+      worker.onmessage = null;
+      next();
+      return;
+    }
+    if (m.type === 'best') {
+      best = m;
+      if (m.fen !== c.fen) failures.push(`${c.name}: echoed a different fen`);
+      finish();
     }
   };
-  worker.postMessage({ type: 'think', fen, ms: 800 });
-};
+
+  watchdog = setTimeout(() => {
+    log(`${c.name.padEnd(18)} FAIL (timed out)`);
+    failures.push(`${c.name}: timed out`);
+    worker.onmessage = null;
+    next();
+  }, c.ms + 6000);
+
+  worker.postMessage({ type: 'think', id, fen: c.fen, ms: c.ms });
+}
+
 next();
 </script></body></html>

@@ -17,8 +17,11 @@ import { MoveReader } from './track.js';
 import { Coach } from './coach.js';
 
 const MAX_EDGE = 720;          // detection resolution, long edge
-const MS = 1800;               // engine time budget
+const MS = 2000;               // engine time budget
 const DEMO = new URLSearchParams(location.search).has('demo');
+const SIDE_KEY = 'ar-chess.side';
+const ENGINE_STALL_MS = 8000;  // a worker that has not answered by then is wedged
+const ENGINE_RETRY_MS = 4000;  // backoff after a worker/engine failure
 
 const view = document.getElementById('view');
 const ctx = view.getContext('2d', { willReadFrequently: true });
@@ -28,16 +31,30 @@ const bestEl = document.getElementById('best');
 const hintEl = document.getElementById('hint');
 const sideSel = document.getElementById('side');
 
+/** The side the player chose last time. White is the default: the coach is
+ * most useful to the person moving up the board, and the request that led here
+ * was "always show White's move". The selector still covers Black. */
+function savedSide() {
+  try {
+    const s = localStorage.getItem(SIDE_KEY);
+    if (s === 'w' || s === 'b') return s;
+  } catch { /* private mode: fall through */ }
+  return 'w';
+}
+
+const startSide = savedSide();
+sideSel.value = startSide;
+
 const video = document.createElement('video');
 video.playsInline = true;
 video.muted = true;
 video.autoplay = true;
 
 let vw = 640, vh = 480;
-let tracker = new BoardTracker({ side: sideSel.value });
+let tracker = new BoardTracker({ side: startSide });
 let reader = new MoveReader();
 const game = new Chess();
-const coach = new Coach(game, { side: sideSel.value });
+const coach = new Coach(game, { side: startSide });
 let worker = null;
 let lastDesc = null;           // descriptor of the last sampled frame
 const sampler = new BoardSampler();   // the grid descriptors are sampled on
@@ -49,37 +66,69 @@ let occluded = false;          // a hand/arm is over the board right now
 let desynced = false;          // a board change could not be read as a move
 let holdStatus = 0;
 let status = { text: 'Starting camera…', tone: '' };
+let thinkingSince = 0;         // when the current think request went out
+let lastAsk = 0;               // when the last request went out
+let engineRetryAt = 0;         // do not restart/retry before this
+let engineDepth = 0;
+let engineNodes = 0;
+let engineScore = 0;
+let engineError = '';
 
 /* ------------------------------------------------------------------ */
 /* engine                                                              */
 /* ------------------------------------------------------------------ */
 
 function startWorker() {
+  if (worker) return;
   try {
     worker = new Worker('./js/engine.js', { type: 'module' });
     worker.onmessage = (e) => {
-      const m = e.data;
+      const m = e.data || {};
+      if (m.type === 'error') {
+        if (m.id === coach.req) coach.thinking = false;
+        engineError = m.error || 'engine error';
+        engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+        showBest();
+        return;
+      }
       if (m.type !== 'best') return;
       const live = m.id === coach.req;
-      // the recommendation is the useful thing to read now: let it replace the
-      // transient "move read" message instead of waiting out its hold
-      if (coach.best(m.id, m)) holdStatus = 0;
+      if (coach.best(m.id, m)) {
+        holdStatus = 0;
+        engineError = '';
+        engineRetryAt = 0;
+        engineDepth = m.depth || 0;
+        engineNodes = m.nodes || 0;
+        engineScore = m.score || 0;
+      }
       if (live) showBest();
     };
     worker.onerror = () => {
+      try { worker.terminate(); } catch { /* already gone */ }
       worker = null;
       coach.thinking = false;
+      engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+      engineError = 'engine failed to load';
       showBest();
     };
   } catch {
     worker = null;
+    engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+    engineError = 'engine unavailable';
   }
 }
 
 function describeSuggestion(s) {
-  const pawns = s.score / 100;
-  const sign = pawns > 0 ? '+' : '';
-  return `${s.san}   ${sign}${pawns.toFixed(1)}`;
+  let value;
+  if (Math.abs(s.score) > 90000) {
+    // mate scores are stored as MATE - plies, relative to the side to move
+    const plies = 100000 - Math.abs(s.score);
+    value = `${s.score > 0 ? '#' : '#-'}${Math.max(1, Math.ceil(plies / 2))}`;
+  } else {
+    const pawns = s.score / 100;
+    value = `${pawns > 0 ? '+' : ''}${pawns.toFixed(2)}`;
+  }
+  return `${s.san}   ${value}${s.depth ? `   d${s.depth}` : ''}`;
 }
 
 /**
@@ -90,6 +139,7 @@ function showBest() {
   const g = coach.guidance;
   if (g) bestEl.textContent = describeSuggestion(g);
   else if (coach.thinking) bestEl.textContent = 'thinking…';
+  else if (engineError) bestEl.textContent = `${engineError} — retrying`;
   else if (game.game_over()) bestEl.textContent = game.in_checkmate() ? 'checkmate' : 'draw';
   else bestEl.textContent = '';
 }
@@ -107,16 +157,58 @@ function askEngine() {
   if (!req) return;
   if (!worker) {
     coach.thinking = false;
-    bestEl.textContent = 'engine unavailable';
+    engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+    showBest();
     return;
   }
+  thinkingSince = performance.now();
+  lastAsk = thinkingSince;
   try {
     worker.postMessage({ type: 'think', id: req.id, fen: req.fen, ms: MS });
   } catch {
+    try { worker.terminate(); } catch { /* already gone */ }
     worker = null;
     coach.thinking = false;
-    bestEl.textContent = 'engine unavailable';
+    engineRetryAt = performance.now() + ENGINE_RETRY_MS;
+    engineError = 'engine unavailable';
+    showBest();
   }
+}
+
+/**
+ * Guarantee that a suggestion exists whenever it is our turn.
+ *
+ * Before this, an answer could be lost for good: a worker that failed to load,
+ * an engine that threw, an answer for a position that a spurious read had
+ * already replaced, or a side change mid-think all left "thinking" or a blank
+ * line with no request in flight. This watchdog is called once per frame and
+ * re-asks (with a backoff) whenever it is our move and there is neither a
+ * suggestion nor a live request. It never fights a request that is still
+ * running; a worker that exceeds its budget is restarted.
+ */
+function ensureAdvice(now) {
+  if (!coach.myTurn || coach.guidance || desynced) return;
+
+  if (coach.thinking) {
+    if (thinkingSince && now - thinkingSince < ENGINE_STALL_MS) return;
+    // The worker accepted the request but never answered. Restart it rather
+    // than sit in "thinking…" for the rest of the game.
+    if (worker) { try { worker.terminate(); } catch { /* already gone */ } }
+    worker = null;
+    coach.thinking = false;
+    engineError = 'engine stalled';
+    engineRetryAt = now + ENGINE_RETRY_MS;
+    showBest();
+  }
+
+  if (now < engineRetryAt) return;
+  if (now - lastAsk < 600) return;
+
+  if (!worker) {
+    startWorker();
+    if (!worker) return;
+  }
+  askEngine();
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,10 +265,15 @@ let demo = null;
 
 async function startDemo() {
   const scene = await import('../tests/scene.js');
+  const side = coach.side;
   demo = {
     scene,
     game: new Chess(),
-    quad: scene.makePose(640, 360, { tilt: 0.28, size: Math.min(640, 360) * 0.86 }),
+    quad: scene.makePose(640, 360, {
+      tilt: 0.28,
+      size: Math.min(640, 360) * 0.86,
+      flip: side === 'b',
+    }),
     replies: ['c5', 'd6', 'Nf6', 'e6', 'Be7', 'a6', 'b5', 'O-O'],
     reply: 0,
     plays: 0,
@@ -186,10 +283,7 @@ async function startDemo() {
   hintEl.classList.add('show');
   document.getElementById('hintExtra').textContent =
     'Demo mode: a synthetic board plays both sides. Your move is the one the arrow shows.';
-  // the synthetic scene draws the board from White's side of the table
-  sideSel.value = 'w';
-  tracker = new BoardTracker({ side: 'w' });
-  coach.setSide('w');
+  tracker = new BoardTracker({ side });
   reader = new MoveReader();
 }
 
@@ -323,6 +417,7 @@ function step(now) {
 
   updateStatus(res);
   drawOverlay();
+  ensureAdvice(performance.now());
 
   const dt = performance.now() - t0;
   stepMs = dt;
@@ -553,20 +648,26 @@ function ringSquare(H, square) {
 /* ------------------------------------------------------------------ */
 
 sideSel.addEventListener('change', () => {
-  tracker = new BoardTracker({ side: sideSel.value });
-  coach.setSide(sideSel.value);
+  const side = sideSel.value;
+  try { localStorage.setItem(SIDE_KEY, side); } catch { /* private mode */ }
+  tracker = new BoardTracker({ side });
+  coach.setSide(side);
   reader = new MoveReader();
   lastDesc = null;
   sampler.reset();
   desynced = false;
+  lastAsk = 0;
+  thinkingSince = 0;
+  engineRetryAt = 0;
+  engineError = '';
   if (demo) {
     // the demo scene must be seen from the side being played
     demo.quad = demo.scene.makePose(vw, vh, {
-      tilt: 0.28, size: Math.min(vw, vh) * 0.86, flip: sideSel.value === 'b',
+      tilt: 0.28, size: Math.min(vw, vh) * 0.86, flip: side === 'b',
     });
   }
   syncDemo();
-  setStatus('Switched side — hold the board in view', '');
+  setStatus(`Switched to ${coach.sideName} — hold the board in view`, '');
   askEngine();
 });
 
@@ -627,4 +728,9 @@ window.__ar = () => ({
   history: game.history(),
   suggestion: coach.guidance ? coach.guidance.san : null,
   pending: coach.suggestion ? coach.suggestion.san : null,
+  req: coach.req,
+  depth: engineDepth,
+  nodes: engineNodes,
+  eval: engineScore,
+  engineError,
 });

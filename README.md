@@ -29,13 +29,15 @@ Live: <https://ar-chess-web.vercel.app>
   squares are sampled on a grid that is *kept* between frames and only moved when
   the board itself moves, so a sub-pixel re-fit cannot fake a change on a dozen
   squares. Whichever side moved is detected; no "it is my turn" button.
-- **Recommends your reply.** Once it is your turn, the engine (alpha-beta,
-  quiescence, iterative deepening, in a Web Worker) returns the best move; it is
-  drawn as an arrow with the piece's square and the destination both ringed, and
-  the evaluation in the HUD. The arrow is yours only: while the opponent is to
-  move there is no arrow,
-  and the engine does not waste its budget on a move the opponent's reply would
-  replace.
+- **Recommends your reply.** Once it is your turn, a real search engine running in
+  a Web Worker returns the best move: 0x88 board, iterative deepening,
+  principal-variation search, transposition table, null-move and futility pruning,
+  late-move reductions, and a quiescence search over captures and promotions. The
+  move is drawn as an arrow with the piece's square and the destination both
+  ringed, with the evaluation and depth in the HUD. In the ~2 s budget it reaches
+  depth 9–11, so it finds mates and wins material rather than guessing. The arrow
+  is yours only: while the opponent is to move there is no arrow, and the engine
+  does not waste its budget on a move the opponent's reply would replace.
 - **Verifies the move was actually played.** When the board changes, the read is
   compared with the recommendation. The arrow is dropped in the same frame the
   move is read — before the next frame is drawn — and the app then waits for the
@@ -43,8 +45,12 @@ Live: <https://ar-chess-web.vercel.app>
   arrow (and asks for a resync): guidance is never left pointing at a position
   that no longer exists. If a hand is over the board the arrow is held while the
   move is hidden, and cleared the moment the move underneath it is confirmed.
-- **Your side.** With "I play Black" selected the app expects the board to be seen
-  from Black's side of the table and names the squares accordingly.
+- **Your side.** White is the default, because the person holding the phone is
+  usually the one moving up the board, and the choice is remembered across reloads.
+  Select "I play Black" and the app expects the board to be seen from Black's side
+  of the table and names the squares accordingly. A suggestion is always produced
+  when it is the selected side's turn: if a worker ever fails or stalls, the app
+  restarts it and asks again instead of leaving the line blank.
 
 Demo without a camera: **`?demo=1`** renders a synthetic board that plays both
 sides. The opponent's replies are scripted; your side plays exactly the move the
@@ -98,9 +104,13 @@ a desktop.
   move produces exactly this change set, and that it is the recommended one. A
   board whose position has already drifted from the app's game cannot be repaired
   by reading; use **Resync**.
-- The engine searches for a fixed time budget (~1.8 s), which is roughly depth 3–4
-  with this move generator. It plays sensibly and finds mates, but it is not a
-  strong engine.
+- The engine is a compact 0x88 search, not Stockfish. Its move generator is
+  perft-exact and the search reaches depth 9–11 in the ~2 s budget, which is
+  enough to see mates, hanging pieces and most short tactics. It is still a small
+  engine: in quiet, roughly equal positions several moves score within a few
+  centipawns and the one it picks can differ from opening theory (`Ne2` instead of
+  `Nf3`, for example). Treat it as a strong club player that is always tactically
+  alert, not as an oracle.
 
 ## Running locally
 
@@ -120,7 +130,10 @@ js/app.js           camera loop, tracking, AR overlay
 js/vision.js        board detection & tracking, square sampling
 js/track.js         change set -> chess move
 js/coach.js         read -> recommend -> verify loop, game state, no DOM
-js/engine.js        search engine (module worker)
+js/engine.js        worker boundary: search -> SAN, legality cross-check
+js/engine-board.js  0x88 board, FEN, Zobrist, move generation, make/unmake
+js/engine-eval.js   tapered evaluation
+js/engine-search.js alpha-beta/PVS/TT/quiescence search
 vendor/chess.js     chess.js 0.13.4 (ES module build, vendored)
 tests/               synthetic scenes and diagnostic pages
 ```
